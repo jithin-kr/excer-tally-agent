@@ -1,41 +1,23 @@
 {
-  "name": "tally-prime-mcp",
+  "name": "excer-tally-agent",
   "version": "0.1.0",
-  "description": "Tally Prime MCP server — exposes Tally Prime XML/HTTP gateway (port 9000) as Model Context Protocol tools for Claude Cowork, Claude Desktop, and other MCP clients.",
+  "private": true,
+  "description": "On-premises agent bridging Excer Global's Next.js app to TallyPrime's XML gateway. Forked from ShrutiSaagar/tally-prime-mcp (MIT).",
   "type": "module",
   "main": "dist/index.js",
-  "bin": {
-    "tally-prime-mcp": "bootstrap.cjs"
-  },
-  "files": [
-    "dist",
-    "bootstrap.cjs",
-    "README.md",
-    "LICENSE"
-  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node bootstrap.cjs",
     "dev": "tsc -w -p tsconfig.json",
-    "clean": "rm -rf dist",
-    "prepare": "npm run build"
+    "start": "node dist/index.js",
+    "doctor": "node dist/doctor.js",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "clean": "rm -rf dist"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
-  "keywords": [
-    "tally",
-    "tally-prime",
-    "mcp",
-    "model-context-protocol",
-    "accounting",
-    "erp",
-    "claude",
-    "xml"
-  ],
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.4",
     "fast-xml-parser": "^4.5.0",
     "undici": "^6.21.0",
     "zod": "^3.23.8"

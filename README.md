@@ -1,222 +1,186 @@
-# Tally Prime MCP Server
+# excer-tally-agent
 
-A Model Context Protocol (MCP) server that bridges **Tally Prime's XML/HTTP gateway** to MCP clients like **Claude Cowork**, Claude Desktop, Claude in Chrome, ChatGPT Desktop, Perplexity Desktop, Cursor, and any other tool that speaks MCP.
+On-premises agent bridging the Excer Global Next.js app to TallyPrime's XML gateway.
 
-It exposes Tally Prime as a set of typed tools — list/create masters, post vouchers, run reports — built directly on top of the documented Tally XML envelopes:
-
-- [Understanding Tally XML Tags](https://help.tallysolutions.com/understanding-tally-xml-tags/)
-- [XML Integration](https://help.tallysolutions.com/xml-integration/)
-- [Sample XML](https://help.tallysolutions.com/sample-xml/)
+Forked from [ShrutiSaagar/tally-prime-mcp](https://github.com/ShrutiSaagar/tally-prime-mcp) (MIT).
+The upstream project exposed Tally to LLMs over MCP; this fork keeps its XML layer and replaces
+the MCP surface with an HTTP API, an AlterID poll loop, and a heartbeat.
 
 ---
 
-## Prerequisites
+## Why this exists
 
-1. **Tally Prime** (Silver or Gold edition recommended — the Educational edition restricts dates and will return partial data).
-2. **Node.js 18 or newer** — **this is non-negotiable**. The MCP SDK uses ES modules; Node 8/10/12/14/16 will fail at startup with `SyntaxError: Unexpected token import`.
-   - Check with `node --version`. If it reports anything below `v18`, install the latest LTS from [nodejs.org](https://nodejs.org/) (use the **64-bit MSI** on Windows).
-   - On Windows specifically, make sure your `claude_desktop_config.json` points at the new install — usually `C:\\Program Files\\nodejs\\node.exe`, **not** `C:\\Program Files (x86)\\nodejs\\node.exe`.
-3. Tally's XML/HTTP gateway enabled.
+Tally is a Windows desktop application. It has **no cloud API, no webhooks, and no outbound push
+of any kind**. Its only general-purpose integration surface is XML over HTTP on port 9000, and
+that port must never be exposed to the internet — it has no authentication and no TLS.
 
-### Enable the Tally XML gateway
-
-Open Tally Prime, then:
+So the app cannot talk to Tally directly. This agent runs on the client's premises next to Tally
+and is reachable from the app through a Cloudflare Tunnel, which is an **outbound** connection
+from their network. No firewall changes, no port forwarding, no static IP.
 
 ```
-F1 (Help) > Settings > Connectivity > Client/Server configuration
+ CLIENT PREMISES (LAN)                        VERCEL
+ ┌──────────────────────────────┐            ┌────────────────────────────┐
+ │  TallyPrime :9000            │            │  Next.js app               │
+ │      ▲ XML/HTTP (localhost)  │            │                            │
+ │  ┌───┴──────────────────┐    │ Cloudflare │  lib/tally/connector.ts ───┼─► push
+ │  │  excer-tally-agent   │◄───┼──Tunnel────┼──                          │
+ │  │  :7010 (127.0.0.1)   │    │            │  /api/tally/pull       ◄───┼── deltas
+ │  │  • HTTP server       │────┼─ HTTPS out ┼─►/api/tally/heartbeat  ◄───┼── liveness
+ │  │  • AlterID poll loop │    │            │                            │
+ │  │  • heartbeat         │    │            │  TallyJob queue (Postgres) │
+ │  └──────────────────────┘    │            └────────────────────────────┘
+ └──────────────────────────────┘
 ```
 
-Set:
-
-```
-TallyPrime acts as = Both        (or Server)
-Port              = 9000
-```
-
-Quick check — with Tally running you should be able to `curl http://localhost:9000` and get an XML response.
+**Read is ~15 seconds behind. Write is 1–3 seconds.** That asymmetry is Tally's design, not ours:
+we can call Tally whenever we like, but Tally can never call us, so reads are polling.
 
 ---
 
-## Install
+## Layout
+
+| Path | Origin | What it does |
+|---|---|---|
+| `src/tally/client.ts` | upstream | POSTs XML to Tally, parses failure envelopes |
+| `src/tally/xml.ts` | upstream | Export/Import envelopes, date + escaping helpers |
+| `src/tally/util.ts` | upstream | Tally value coercion (`"42 Nos"` → `42`) |
+| `src/tally/voucher-render.ts` | upstream + `REMOTEID` | Generic voucher/ledger/inventory XML |
+| `src/excer/contract.ts` | **new** | The wire contract with the Next.js app |
+| `src/excer/config.ts` | **new** | Agent config + all installation-specific Tally names |
+| `src/excer/vouchers.ts` | **new** | The six Excer payloads → Tally XML |
+| `src/excer/masters.ts` | **new** | AlterID-based incremental read |
+| `src/server.ts` | **new** | The two HTTP endpoints the app calls |
+| `src/poll-loop.ts` | **new** | Two-stage "has anything changed?" polling |
+| `src/heartbeat.ts` | **new** | Liveness reporting |
+| `src/doctor.ts` | **new** | Day-one validation against a real Tally |
+
+Deleted from upstream: `src/tools/reports.ts`, `src/index.ts` (MCP entry), `src/jsonschema.ts`,
+`bootstrap.cjs`, and the MCP SDK dependency.
+
+---
+
+## Setup
 
 ```bash
-git clone <this folder>
-cd "Tally Prime MCP"
 npm install
+cp .env.example .env      # then edit it
 npm run build
+npm run doctor            # verify against a real Tally BEFORE anything else
+npm start
 ```
 
-That produces `dist/index.js`, which is the executable MCP server entry point.
+The server binds to `127.0.0.1` on purpose. The only route in is the tunnel. Binding `0.0.0.0`
+would expose an agent that can write to the accounting books to the entire office LAN.
 
 ---
 
-## Wire it into Claude Cowork / Claude Desktop
+## The endpoints
 
-Edit your `claude_desktop_config.json` (open via **Claude Desktop → Settings → Developer → Edit Config**) and add:
+Both mirror the dev fixture at `src/app/api/dev-fake-tally/` in the main repo, so pointing
+`TALLY_CONNECTOR_BASE_URL` at this agent instead of at the fixture is a pure config change.
 
-**Windows:**
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/health` | none | Liveness; reports whether Tally is reachable |
+| `GET` | `/api/export/masters?sinceAlterId=N` | `x-api-key` | Stock items + customer ledgers |
+| `POST` | `/api/import/voucher` | `x-api-key` | Post one of the six voucher types |
 
-```json
-{
-  "mcpServers": {
-    "tally-prime": {
-      "command": "C:\\Program Files\\nodejs\\node.exe",
-      "args": ["C:\\absolute\\path\\to\\Tally Prime MCP\\bootstrap.cjs"],
-      "env": {
-        "TALLY_HOST": "localhost",
-        "TALLY_PORT": "9000"
-      }
-    }
-  }
-}
-```
+### Idempotency
 
-**macOS / Linux:**
-
-```json
-{
-  "mcpServers": {
-    "tally-prime": {
-      "command": "node",
-      "args": ["/absolute/path/to/Tally Prime MCP/bootstrap.cjs"],
-      "env": {
-        "TALLY_HOST": "localhost",
-        "TALLY_PORT": "9000"
-      }
-    }
-  }
-}
-```
-
-`bootstrap.cjs` is a CommonJS shim that first verifies Node ≥ 18, then loads the ES-module server from `dist/index.js`. Pointing at the shim instead of `dist/index.js` directly is what surfaces a readable error if the wrong Node version is in use.
-
-Restart Claude. The Tally tools (prefix `tally_`) will appear in the **Tools** menu.
-
-### Optional environment variables
-
-| Variable           | Default        | Notes                                                                 |
-| ------------------ | -------------- | --------------------------------------------------------------------- |
-| `TALLY_HOST`       | `localhost`    | Tally machine's hostname / IP.                                        |
-| `TALLY_PORT`       | `9000`         | Port from the Tally Client/Server settings.                           |
-| `TALLY_COMPANY`    | *(unset)*      | Default `SVCURRENTCOMPANY`. Otherwise the active company is used.     |
-| `TALLY_TIMEOUT_MS` | `60000`        | HTTP timeout — bump for very large data exports.                      |
+Every voucher carries `<REMOTEID>`, built by `buildTallyRemoteId()` in the main app. On a retry
+the same REMOTEID is sent, Tally ignores the duplicate, and the agent returns
+`{ duplicate: true }` — which the app treats as **success**, because the voucher it wanted does
+exist in Tally. Without this, one flaky network moment produces two sales orders in a real
+client's books.
 
 ---
 
-## Tools
+## Your one decision
 
-All tools share an optional `targetCompany` argument; if omitted the currently active company in Tally is used.
+`splitGst()` in `src/excer/vouchers.ts` is **deliberately left unimplemented**. It throws.
 
-### Master data
+Everything else in this agent is mechanical translation, but this one is a judgement call about
+how the business actually operates, and getting it wrong misfiles tax in a client's books:
 
-| Tool                       | What it does                                                              |
-| -------------------------- | ------------------------------------------------------------------------- |
-| `tally_list_companies`     | List all companies known to the running Tally Prime instance.             |
-| `tally_list_masters`       | List masters of a collection: Ledger, Group, StockItem, Unit, Godown, etc.|
-| `tally_get_ledger`         | Fetch the full master record for one ledger.                              |
-| `tally_create_ledger`      | Create or alter a ledger (`alter: true`). Set `parent`, optional address/GSTIN. |
-| `tally_create_group`       | Create or alter a group.                                                  |
-| `tally_create_stock_item`  | Create or alter a stock item.                                             |
-| `tally_create_stock_group` | Create or alter a stock group.                                            |
-| `tally_create_unit`        | Create a simple or compound Unit of Measure.                              |
-| `tally_create_godown`      | Create a godown / location.                                               |
-| `tally_create_cost_centre` | Create a cost centre.                                                     |
+Indian GST splits **CGST + SGST** for a sale inside your own state and **IGST** for a sale to
+another state. Excer is in Kerala. The function receives the tax total, what we know about the
+buyer (`gstin` and/or `state`), and the configured `homeState`.
 
-### Vouchers
+Three things to decide:
 
-| Tool                    | What it does                                                                |
-| ----------------------- | --------------------------------------------------------------------------- |
-| `tally_create_voucher`  | Post any voucher type (Sales, Purchase, Receipt, Payment, Journal, Contra, Stock Journal, Debit/Credit Note, custom). Ledger entries use **signed amounts: negative = Debit, positive = Credit**; totals must net to zero. Set `isInvoice: true` and supply `inventoryEntries` with `accountingLedger` for item invoices. |
-| `tally_alter_voucher`   | Modify an existing voucher by voucher type + number + date.                 |
-| `tally_cancel_voucher`  | Cancel an existing voucher.                                                 |
-| `tally_get_voucher`     | Fetch full XML for a voucher by number.                                     |
+1. **Which signal do you trust?** A GSTIN's first two digits are a government-issued state code
+   (`32` = Kerala) and can't be typo'd into a different *valid* state. But unregistered buyers
+   have no GSTIN and free-text `state` is all you get.
+2. **What if both are missing?** Defaulting to intra-state silently misfiles inter-state sales —
+   discovered by an accountant months later. Throwing blocks the push until someone fixes the
+   customer record — discovered in the admin panel today. Both are defensible; they fail in very
+   different places.
+3. **Rounding.** CGST and SGST are each half the total, and an odd number of paise won't split
+   evenly. Tally rejects a voucher whose entries don't balance to the paisa, so the two halves
+   must still sum to exactly `taxTotal`.
 
-### Reports
-
-| Tool                       | What it does                                                                   |
-| -------------------------- | ------------------------------------------------------------------------------ |
-| `tally_trial_balance`      | Trial Balance — opening + closing balance per ledger over a period.            |
-| `tally_balance_sheet`      | Balance Sheet — closing balances as on a date.                                 |
-| `tally_profit_loss`        | Profit & Loss — net activity per ledger over a period.                         |
-| `tally_ledger_balance`     | Single ledger closing balance as on a date.                                    |
-| `tally_ledger_account`     | Voucher-level statement for one ledger.                                        |
-| `tally_ledger_outstanding` | Outstanding bills for one party ledger.                                        |
-| `tally_day_book`           | Day Book for a date range, optionally filtered by voucher type.                |
-| `tally_stock_summary`      | Closing qty / rate / value per stock item as on a date.                        |
-| `tally_stock_item_balance` | Opening + closing for a single stock item.                                     |
-| `tally_stock_item_account` | Voucher-level inward/outward movement for a single stock item.                 |
-| `tally_bills_outstanding`  | Bills Receivable or Bills Payable summary.                                     |
-| `tally_chart_of_accounts`  | Group hierarchy (BS vs PL, Dr vs Cr, affects gross profit).                    |
-| `tally_raw_request`        | Escape hatch — POST any custom Tally XML envelope and return the raw response. |
+About 8 lines. The doc comment on the function repeats all of this in place.
 
 ---
 
-## Conventions
+## Required changes in the main app
 
-- **Dates** accept `YYYY-MM-DD`, `DD-MM-YYYY`, `DD/MM/YYYY`, `D-Mon-YYYY`, or `YYYYMMDD`. Internally normalised to Tally's uni-date `YYYYMMDD`.
-- **Amounts** in reports follow Tally's sign convention: **negative = Debit, positive = Credit**.
-- **Voucher posting** also uses signed amounts in `ledgerEntries`: negative for Debits, positive for Credits. Total **must** net to zero or Tally will reject the voucher with a "Voucher totals do not match" error.
-- **Targeted company**: every tool takes an optional `targetCompany`. If unset, the request flows to the active company; set `TALLY_COMPANY` env var to make a global default.
+Found while building the agent against the existing payload builders in
+`src/features/tally/mapping.ts`:
 
----
-
-## Example prompts you can try in Claude
-
-> *List the companies loaded in Tally.*
-
-> *Give me the trial balance for 1 April 2024 to 31 March 2025.*
-
-> *Create a ledger named "Acme Corp" under Sundry Debtors with GSTIN 29ABCDE1234F1Z5 and address "12 MG Road, Bengaluru, 560001".*
-
-> *Post a sales voucher dated today: 1× "Sony TV 32-inch" at ₹25,000 to "Acme Corp", VAT 14% extra. Allocate to the "Sales" ledger.*
-
-> *Show outstanding receivables as of today, sorted by amount.*
-
-> *Stock summary as on 31 March — flag any item with closing value below cost.*
+1. **`buildCancelVoucherPayload` must include the voucher number.** Tally cancels a voucher by
+   its **voucher number**, not by REMOTEID. The app already stores it on
+   `Order.tallyVoucherNumber` when the Sales Order push succeeds, but doesn't send it. Without
+   it the agent returns a clear error and cannot cancel. Add `salesOrderVoucherNumber`.
+2. **`buildDeliveryNotePayload` needs `buyerLedgerName` and `referencedVoucherNumber`.** A
+   delivery note still posts against the customer and should reference its sales order.
+3. **`buildCreditNotePayload` needs `buyerLedgerName` and `buyerGstin`.** The ledger name to post
+   against, and the GSTIN so the tax reversal can pick CGST+SGST vs IGST.
+4. **Two new routes**: `POST /api/tally/pull` (accepts master deltas) and
+   `POST /api/tally/heartbeat` (accepts liveness). Both bearer-authenticated.
+5. **`connector.ts`**: point `TALLY_CONNECTOR_BASE_URL` at the tunnel hostname. No code change —
+   mock mode still works for local development.
 
 ---
 
-## Architecture
+## Not yet verified against a real Tally
 
-```
-src/
-├── index.ts                  # MCP stdio server (entry point)
-├── jsonschema.ts             # Lightweight Zod → JSON Schema for tool inputs
-├── tally/
-│   ├── config.ts             # Reads TALLY_HOST / TALLY_PORT / TALLY_COMPANY
-│   ├── client.ts             # HTTP POST wrapper around Tally :9000
-│   ├── xml.ts                # Envelope builders + response parser (uses fast-xml-parser)
-│   └── util.ts               # CSV rendering, amount/date parsing
-└── tools/
-    ├── types.ts              # Tool descriptor type
-    ├── masters.ts            # Ledger, Group, StockItem, Unit, Godown, CostCentre
-    ├── vouchers.ts           # Create / alter / cancel / get voucher
-    └── reports.ts            # Trial Balance, P&L, Balance Sheet, Day Book, Stock, etc.
-```
+This fork has **never been run against a live Tally installation** — neither has upstream, as far
+as we can tell. It typechecks, builds, serves, and rejects bad input correctly. That is all it
+currently proves.
 
-Every tool builds an XML envelope that mirrors the official Tally Help pages. The `tally_raw_request` tool is the escape hatch — pass any well-formed `<ENVELOPE>` and you get the raw response, useful for custom TDL reports.
+Verify each of these before trusting the agent with real books:
 
----
+- [ ] `<REMOTEID>` is accepted on vouchers and does suppress duplicates. Upstream's captured
+      fixtures use `<REMOTEALTGUID>` for **masters**; `<REMOTEID>` is the documented **voucher**
+      field. We may need both.
+- [ ] The Company object exposes `ALTMSTID` / `ALTVCHID`. **Incremental sync depends entirely on
+      this.** `npm run doctor` warns if they come back as 0.
+- [ ] `$AlterID > n` works as a collection `FILTER` on this Tally build.
+- [ ] Stock Journal XML — cable cuts may need `SOURCELIST`/`DESTINATIONLIST` rather than the flat
+      `ALLINVENTORYENTRIES.LIST` this renders.
+- [ ] Field names on stock items: `OpeningRate` for base price, whether `HSNCode` lives on the
+      item or the stock **group**.
+- [ ] Every name in `.env.example`'s bottom section — voucher types, ledgers, the customer group.
+      The defaults are Tally's out-of-the-box names and are very likely wrong here.
 
-## Troubleshooting
-
-**`SyntaxError: Unexpected token import` at startup**  
-Your Node.js is older than 18. Check with `node --version`. Install the latest LTS from [nodejs.org](https://nodejs.org/) and update the `command` field in `claude_desktop_config.json` to point at the new `node.exe`. On Windows that's almost always `C:\\Program Files\\nodejs\\node.exe` (the 64-bit install) — **not** `C:\\Program Files (x86)\\nodejs\\node.exe` (the legacy 32-bit one your error log showed).
-
-**`Could not connect to Tally at http://localhost:9000`**  
-Tally isn't running, or the XML gateway isn't enabled. Re-check **F1 → Settings → Connectivity**.
-
-**`Tally returned failure status: DESC not found`**  
-The `<ID>` (report or collection name) doesn't exist in your Tally. Try `tally_list_masters` first to discover what's defined.
-
-**`Voucher totals do not match`**  
-The signed `amount` values in `ledgerEntries` don't net to zero. Negative = Debit, positive = Credit.
-
-**Educational version warnings**  
-Tally Educational restricts dates to 1st, 2nd, and the last day of each month. Use a Silver/Gold licence for full data.
+Post your first voucher into a **test company**, never the live one.
 
 ---
 
-## License
+## Still blocked on the client
 
-MIT
+Neither is a code problem, and both outrank everything above:
+
+1. **May we install a Windows Service on the Tally machine?** If not, this whole approach needs
+   rethinking. Find out first.
+2. **Who owns stock — Tally, the app, or both reconciled?** (CLAUDE.md §20.5, options A/B/C.)
+   Today the app deducts stock on dispatch. Once we also post Delivery Notes, both systems deduct
+   the same goods unless this is decided deliberately.
+
+---
+
+## Licence
+
+MIT, inherited from upstream. See `LICENSE` and `NOTICE`.

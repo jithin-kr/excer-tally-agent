@@ -1,0 +1,16 @@
+excer-tally-agent
+Copyright (c) 2026 Velvetek Systems / Excer Global
+
+This product includes software developed as part of tally-prime-mcp
+(https://github.com/ShrutiSaagar/tally-prime-mcp), Copyright (c) 2026, licensed
+under the MIT License. See LICENSE for the full text.
+
+Files derived from that project, in whole or in part:
+  src/tally/client.ts          (unmodified)
+  src/tally/config.ts          (unmodified)
+  src/tally/util.ts            (unmodified)
+  src/tally/xml.ts             (unmodified)
+  src/tally/voucher-render.ts  (derived from src/tools/vouchers.ts; MCP tool
+                                wrappers removed, REMOTEID support added)
+
+All other files under src/ are original to this project.

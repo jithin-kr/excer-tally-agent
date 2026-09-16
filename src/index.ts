@@ -1,89 +1,45 @@
-#!/usr/bin/env node
-// Tally Prime MCP server — entry point.
-// Speaks the Model Context Protocol over stdio, exposing Tally's XML/HTTP
-// gateway as a set of typed tools that Claude Cowork (and any other MCP
-// client) can call directly.
+// Entry point: start the HTTP server, the poll loop and the heartbeat.
 
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
-import { zodToJsonSchema } from "./jsonschema.js";
-
+import { loadAgentConfig } from "./excer/config.js";
 import { TallyClient } from "./tally/client.js";
-import { loadConfig } from "./tally/config.js";
-import { masterTools } from "./tools/masters.js";
-import { voucherTools } from "./tools/vouchers.js";
-import { reportTools } from "./tools/reports.js";
-import type { Tool } from "./tools/types.js";
-
-const allTools: Tool[] = [...masterTools, ...voucherTools, ...reportTools];
-const toolsByName = new Map(allTools.map((t) => [t.name, t]));
+import { createAgentServer } from "./server.js";
+import { createPollState, startPollLoop } from "./poll-loop.js";
+import { AGENT_VERSION, startHeartbeat } from "./heartbeat.js";
 
 async function main() {
-  const config = loadConfig();
-  const client = new TallyClient(config);
+  const config = loadAgentConfig();
+  const client = new TallyClient();
+  const state = createPollState();
 
-  const server = new Server(
-    {
-      name: "tally-prime-mcp",
-      version: "0.1.0",
-    },
-    {
-      capabilities: {
-        tools: {},
-      },
-    }
-  );
+  const server = createAgentServer(config, client);
+  const stopPoll = startPollLoop(config, client, state);
+  const stopHeartbeat = startHeartbeat(config, client, state);
 
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: allTools.map((t) => ({
-      name: t.name,
-      description: t.description,
-      inputSchema: zodToJsonSchema(t.inputSchema),
-    })),
-  }));
-
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
-    const tool = toolsByName.get(req.params.name);
-    if (!tool) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: `Unknown tool: ${req.params.name}` }],
-      };
-    }
-    try {
-      const result = await tool.handler(req.params.arguments ?? {}, client);
-      return {
-        content: [{ type: "text", text: result }],
-      };
-    } catch (err: any) {
-      return {
-        isError: true,
-        content: [
-          {
-            type: "text",
-            text: `Error: ${err?.message ?? String(err)}`,
-          },
-        ],
-      };
-    }
+  server.listen(config.port, "127.0.0.1", () => {
+    console.log(`excer-tally-agent v${AGENT_VERSION}`);
+    console.log(`  listening      http://127.0.0.1:${config.port}`);
+    console.log(`  tally          ${client.config.url}`);
+    console.log(`  company        ${client.config.defaultCompany ?? "(active company)"}`);
+    console.log(`  poll every     ${config.pollIntervalMs}ms`);
+    console.log(`  reporting to   ${config.appBaseUrl ?? "(no app URL configured)"}`);
   });
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  // Bound to 127.0.0.1 on purpose: the only route in is the Cloudflare Tunnel, which connects
+  // to localhost. Binding 0.0.0.0 would expose the agent to the whole office LAN, and the agent
+  // can write to the accounting books.
 
-  // Log to stderr only — stdout is reserved for MCP framing.
-  process.stderr.write(
-    `[tally-prime-mcp] connected, target=${config.url}` +
-      (config.defaultCompany ? `, company=${config.defaultCompany}` : "") +
-      `, tools=${allTools.length}\n`
-  );
+  const shutdown = () => {
+    console.log("shutting down…");
+    stopPoll();
+    stopHeartbeat();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 5_000).unref();
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
 main().catch((err) => {
-  process.stderr.write(`[tally-prime-mcp] fatal: ${err?.message ?? err}\n`);
+  console.error("Failed to start:", err instanceof Error ? err.message : err);
   process.exit(1);
 });
