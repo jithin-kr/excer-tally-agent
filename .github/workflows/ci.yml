@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [excer, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/excer' }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Typecheck & build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      # The agent's own start-up path: a config error here means the Windows
+      # Service would fail to boot on the client's machine, where nobody is
+      # watching a terminal. Cheap to catch in CI instead.
+      - name: Boot smoke test
+        env:
+          AGENT_API_KEY: ci-smoke-test-key
+          AGENT_PORT: "7010"
+          POLL_INTERVAL_MS: "3600000"
+          HEARTBEAT_INTERVAL_MS: "3600000"
+        run: |
+          node dist/index.js &
+          AGENT_PID=$!
+          # Give it a moment to bind, then check it answers and reports honestly
+          # that Tally is unreachable (there is no Tally on a CI runner).
+          for i in $(seq 1 20); do
+            if curl -sf http://127.0.0.1:7010/health > /tmp/health.json; then break; fi
+            sleep 0.5
+          done
+          kill $AGENT_PID 2>/dev/null || true
+          echo "--- /health ---"
+          cat /tmp/health.json
+          node -e "
+            const h = require('/tmp/health.json');
+            if (h.tallyReachable !== false) throw new Error('expected tallyReachable=false on a runner with no Tally');
+            if (!h.agentId) throw new Error('missing agentId');
+            console.log('smoke test passed');
+          "
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Fail on high or critical advisories
+        # The agent has four dependencies and no legacy debt, so unlike the main
+        # app it can afford to gate at `high` rather than `critical`.
+        run: npm audit --audit-level=high
