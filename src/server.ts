@@ -119,7 +119,13 @@ export function createAgentServer(config: AgentConfig, client: TallyClient) {
       if (!remoteId) return json(res, 400, { error: "remoteId is required" });
 
       try {
-        const xml = buildVoucherXml(type, body, config.tallyNames, client.config.defaultCompany);
+        const xml = buildVoucherXml(
+          type,
+          body,
+          config.tallyNames,
+          client.config.defaultCompany,
+          config.postVouchersAsOptional
+        );
         const responseXml = await client.send(xml);
         const result = parseImportResult(responseXml);
 

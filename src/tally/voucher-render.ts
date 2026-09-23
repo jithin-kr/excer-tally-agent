@@ -15,6 +15,13 @@
 // TallyConnector's captured fixtures use <REMOTEALTGUID> for *masters*; <REMOTEID> is the
 // documented voucher field. Verify both during the one-day validation pass before trusting
 // duplicate suppression.
+//
+// EXCER ADDITION: `isOptional` — stamped onto the voucher as <ISOPTIONAL>Yes</ISOPTIONAL>, which
+// Tally posts to its "Optional Vouchers" register instead of the regular books. Added 2026-09-23
+// when the main app's push became fully automatic (CLAUDE.md §21/§22): an unattended push can no
+// longer rely on an admin's button-press as the review step, so Optional makes Tally itself the
+// review gate — an accountant converts each voucher to Regular inside Tally before it affects any
+// balance or report. UNVERIFIED against a live Tally, same as <REMOTEID> above.
 
 import { z } from "zod";
 import { buildImportEnvelope, escapeXml, tallyDate } from "./xml.js";
@@ -68,6 +75,8 @@ export const voucherSchema = z.object({
   inventoryEntries: z.array(inventoryEntrySchema).optional(),
   /** EXCER: idempotency key, stamped as <REMOTEID>. */
   remoteId: z.string().optional(),
+  /** EXCER: posts as an Optional voucher — see the file header. */
+  isOptional: z.boolean().optional(),
 });
 
 export type VoucherInput = z.infer<typeof voucherSchema>;
@@ -153,6 +162,7 @@ export function renderVoucher(args: VoucherInput): string {
       `<PARTYNAME>${escapeXml(args.partyLedger)}</PARTYNAME>`
     : "";
   const narration = args.narration ? `<NARRATION>${escapeXml(args.narration)}</NARRATION>` : "";
+  const optional = args.isOptional ? "<ISOPTIONAL>Yes</ISOPTIONAL>" : "";
 
   return `
     <TALLYMESSAGE xmlns:UDF="TallyUDF">
@@ -165,6 +175,7 @@ export function renderVoucher(args: VoucherInput): string {
         ${party}
         <PERSISTEDVIEW>${escapeXml(view)}</PERSISTEDVIEW>
         <ISINVOICE>${isInvoice ? "Yes" : "No"}</ISINVOICE>
+        ${optional}
         ${narration}
         ${ledgerXml}
         ${invXml}

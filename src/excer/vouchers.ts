@@ -128,7 +128,12 @@ function taxLedgerEntries(
 /*  1. Sales Order                                                            */
 /* -------------------------------------------------------------------------- */
 
-export function buildSalesOrderXml(p: SalesOrderPayload, names: TallyNames, company?: string): string {
+export function buildSalesOrderXml(
+  p: SalesOrderPayload,
+  names: TallyNames,
+  company?: string,
+  postAsOptional = false
+): string {
   const ledgerEntries: LedgerEntry[] = [
     // Party owes us the full invoice value -> Debit.
     { ledger: p.buyer.ledgerName, amount: -p.grandTotal, isPartyLedger: true },
@@ -157,6 +162,7 @@ export function buildSalesOrderXml(p: SalesOrderPayload, names: TallyNames, comp
     view: "Invoice Voucher View",
     ledgerEntries,
     inventoryEntries: toInventory(p.lineItems, names, names.salesLedger),
+    isOptional: postAsOptional,
   });
   return voucherImportEnvelope(body, company);
 }
@@ -168,7 +174,8 @@ export function buildSalesOrderXml(p: SalesOrderPayload, names: TallyNames, comp
 export function buildDeliveryNoteXml(
   p: DeliveryNotePayload,
   names: TallyNames,
-  company?: string
+  company?: string,
+  postAsOptional = false
 ): string {
   // A Delivery Note moves goods, not money: inventory lines only, no ledger postings.
   const body = renderVoucher({
@@ -181,6 +188,7 @@ export function buildDeliveryNoteXml(
     view: "Inventory Voucher View",
     ledgerEntries: [],
     inventoryEntries: toInventory(p.lineItems, names),
+    isOptional: postAsOptional,
   });
   return voucherImportEnvelope(body, company);
 }
@@ -192,7 +200,8 @@ export function buildDeliveryNoteXml(
 export function buildCreditNoteXml(
   p: CreditNotePayload,
   names: TallyNames,
-  company?: string
+  company?: string,
+  postAsOptional = false
 ): string {
   const taxableTotal = p.lineItems.reduce((sum, l) => sum + l.taxableValue, 0);
   const taxTotal = Number((p.totalCreditAmount - taxableTotal).toFixed(2));
@@ -216,6 +225,7 @@ export function buildCreditNoteXml(
     view: "Invoice Voucher View",
     ledgerEntries,
     inventoryEntries: toInventory(p.lineItems, names, names.salesLedger),
+    isOptional: postAsOptional,
   });
   return voucherImportEnvelope(body, company);
 }
@@ -257,7 +267,8 @@ export function buildNewLedgerXml(p: NewLedgerPayload, names: TallyNames, compan
 export function buildStockJournalXml(
   p: StockJournalPayload,
   names: TallyNames,
-  company?: string
+  company?: string,
+  postAsOptional = false
 ): string {
   // UNVERIFIED: Tally's Stock Journal uses DESTINATIONLIST/SOURCELIST in some configurations
   // rather than a flat ALLINVENTORYENTRIES.LIST. This renders the flat form. Confirm against
@@ -279,6 +290,7 @@ export function buildStockJournalXml(
         isDeemedPositive: true,
       },
     ],
+    isOptional: postAsOptional,
   });
   return voucherImportEnvelope(body, company);
 }
@@ -316,20 +328,26 @@ export function buildVoucherXml(
   type: TallyJobType,
   payload: unknown,
   names: TallyNames,
-  company?: string
+  company?: string,
+  postAsOptional = false
 ): string {
   switch (type) {
     case "push_sales_order":
-      return buildSalesOrderXml(payload as SalesOrderPayload, names, company);
+      return buildSalesOrderXml(payload as SalesOrderPayload, names, company, postAsOptional);
     case "push_delivery_note":
-      return buildDeliveryNoteXml(payload as DeliveryNotePayload, names, company);
+      return buildDeliveryNoteXml(payload as DeliveryNotePayload, names, company, postAsOptional);
     case "push_credit_note":
-      return buildCreditNoteXml(payload as CreditNotePayload, names, company);
+      return buildCreditNoteXml(payload as CreditNotePayload, names, company, postAsOptional);
     case "push_new_ledger":
+      // A master creation, not a voucher — "Optional" has no meaning here.
       return buildNewLedgerXml(payload as NewLedgerPayload, names, company);
     case "push_stock_journal":
-      return buildStockJournalXml(payload as StockJournalPayload, names, company);
+      return buildStockJournalXml(payload as StockJournalPayload, names, company, postAsOptional);
     case "push_cancel_sales_order":
+      // Cancels a voucher already pushed (by voucher number). UNVERIFIED whether Tally's Cancel
+      // action applies cleanly to an Optional voucher the accountant hasn't converted yet — see
+      // the README's validation checklist. Left as a real Cancel either way, not made Optional
+      // itself: cancelling is inherently the "undo" action, there is no draft form of it.
       return buildCancelSalesOrderXml(payload as CancelSalesOrderPayload, names, company);
     default:
       throw new Error(`Unknown Tally job type: ${type}`);

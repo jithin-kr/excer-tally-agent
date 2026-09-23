@@ -124,23 +124,30 @@ About 8 lines. The doc comment on the function repeats all of this in place.
 
 ---
 
-## Required changes in the main app
+## Required changes in the main app — DONE (2026-09-23)
 
 Found while building the agent against the existing payload builders in
-`src/features/tally/mapping.ts`:
+`src/features/tally/mapping.ts`. All five are now done on the excer-global side (see its
+CLAUDE.md §22.5 for the file-level detail); only #5 needs a further deployment step once a tunnel
+hostname exists.
 
-1. **`buildCancelVoucherPayload` must include the voucher number.** Tally cancels a voucher by
-   its **voucher number**, not by REMOTEID. The app already stores it on
-   `Order.tallyVoucherNumber` when the Sales Order push succeeds, but doesn't send it. Without
-   it the agent returns a clear error and cannot cancel. Add `salesOrderVoucherNumber`.
-2. **`buildDeliveryNotePayload` needs `buyerLedgerName` and `referencedVoucherNumber`.** A
-   delivery note still posts against the customer and should reference its sales order.
-3. **`buildCreditNotePayload` needs `buyerLedgerName` and `buyerGstin`.** The ledger name to post
-   against, and the GSTIN so the tax reversal can pick CGST+SGST vs IGST.
-4. **Two new routes**: `POST /api/tally/pull` (accepts master deltas) and
-   `POST /api/tally/heartbeat` (accepts liveness). Both bearer-authenticated.
-5. **`connector.ts`**: point `TALLY_CONNECTOR_BASE_URL` at the tunnel hostname. No code change —
-   mock mode still works for local development.
+1. ✅ **`buildCancelVoucherPayload` includes the voucher number.** Tally cancels a voucher by its
+   **voucher number**, not by REMOTEID. `salesOrderVoucherNumber` is now sent, read from
+   `Order.tallyVoucherNumber`.
+2. ✅ **`buildDeliveryNotePayload` sends `buyerLedgerName` and `referencedVoucherNumber`.** A
+   delivery note still posts against the customer and references its sales order.
+3. ✅ **`buildCreditNotePayload` sends `buyerLedgerName` and `buyerGstin`.** The ledger name to
+   post against, and the GSTIN so the tax reversal can pick CGST+SGST vs IGST.
+4. ✅ **Two new routes exist**: `POST /api/tally/pull` (accepts master deltas) and
+   `POST /api/tally/heartbeat` (accepts liveness). Both bearer-authenticated
+   (`TALLY_AGENT_TOKEN` on the app side must match this agent's `EXCER_APP_TOKEN`), and both
+   were added to the app's proxy's public-route allowlist so an unauthenticated call gets a real
+   401 instead of a 307 to `/login`.
+5. ⬜ **`connector.ts`**: still needs `TALLY_CONNECTOR_BASE_URL` pointed at the tunnel hostname
+   once one exists — a deployment step, not code. Mock mode still works for local development.
+
+None of this has been run against this agent talking to a real Tally, or against a real tunnel
+deployment — see "Not yet verified against a real Tally" below, which is unchanged by this.
 
 ---
 
@@ -164,6 +171,12 @@ Verify each of these before trusting the agent with real books:
       item or the stock **group**.
 - [ ] Every name in `.env.example`'s bottom section — voucher types, ledgers, the customer group.
       The defaults are Tally's out-of-the-box names and are very likely wrong here.
+- [ ] `<ISOPTIONAL>Yes</ISOPTIONAL>` (added 2026-09-23, `TALLY_POST_VOUCHERS_AS_OPTIONAL`) actually
+      posts to the Optional Vouchers register instead of being silently ignored — and whether
+      Tally's Cancel action applies cleanly to an Optional voucher the accountant hasn't converted
+      to Regular yet. This flag exists because the main app's push is now fully automatic rather
+      than triggered by an admin clicking a button, so Optional is the new human-review gate — see
+      the main repo's CLAUDE.md §22.9.
 
 Post your first voucher into a **test company**, never the live one.
 

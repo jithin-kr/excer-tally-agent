@@ -43,6 +43,15 @@ export interface AgentConfig {
   heartbeatIntervalMs: number;
   /** Stable id for this agent instance. */
   agentId: string;
+  /**
+   * Posts every voucher into Tally's "Optional Vouchers" register instead of the regular books
+   * (CLAUDE.md §21/§22, decided 2026-09-23 alongside making the app's push fully automatic).
+   * Optional vouchers do not affect any balance or report until an accountant converts them to
+   * Regular inside Tally — that conversion is the human review step, since there is no longer an
+   * admin button-press to serve as one. Default true; only flip to false once the agent has been
+   * proven reliable against a real Tally test company (§22.6).
+   */
+  postVouchersAsOptional: boolean;
   tallyNames: TallyNames;
 }
 
@@ -62,6 +71,14 @@ function int(name: string, fallback: number): number {
   return parsed;
 }
 
+function bool(name: string, fallback: boolean): boolean {
+  const raw = process.env[name]?.trim().toLowerCase();
+  if (!raw) return fallback;
+  if (raw === "true" || raw === "1") return true;
+  if (raw === "false" || raw === "0") return false;
+  throw new Error(`Invalid ${name}: ${raw}. Expected true/false.`);
+}
+
 export function loadAgentConfig(): AgentConfig {
   return {
     port: int("AGENT_PORT", 7010),
@@ -71,6 +88,7 @@ export function loadAgentConfig(): AgentConfig {
     pollIntervalMs: int("POLL_INTERVAL_MS", 15_000),
     heartbeatIntervalMs: int("HEARTBEAT_INTERVAL_MS", 30_000),
     agentId: process.env.AGENT_ID?.trim() || "excer-tally-agent-1",
+    postVouchersAsOptional: bool("TALLY_POST_VOUCHERS_AS_OPTIONAL", true),
     tallyNames: {
       salesOrderVoucherType: process.env.TALLY_VT_SALES_ORDER?.trim() || "Sales Order",
       deliveryNoteVoucherType: process.env.TALLY_VT_DELIVERY_NOTE?.trim() || "Delivery Note",
