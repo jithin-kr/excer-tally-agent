@@ -173,8 +173,8 @@ the conflict, rounding, and both throw paths) are in `test/vouchers.test.ts` —
 
 ## The website's side
 
-Changes in excer-global, recorded in its CLAUDE.md §39. **Made and tested (682 unit tests), but not
-yet committed there** — that working tree has other work in progress:
+Changes in excer-global on branch `fix/tally-agent-live-verification` (CLAUDE.md §39–§40), pushed
+and passing its CI (unit + integration tests); merge it to deploy:
 
 1. ✅ Pull/heartbeat routes, bearer-authenticated (`TALLY_AGENT_TOKEN` = this agent's
    `EXCER_APP_TOKEN`), constant-time token check.
@@ -192,7 +192,12 @@ yet committed there** — that working tree has other work in progress:
    unlinked Tally items instead of logging each as an error — the agent re-sends all stock after
    stock-moving vouchers. Fractional stock is rounded down (`stockLevel` is an Int). The base
    price = Tally's standard selling price + GST, touched only when the item master changed.
-8. ⬜ Deployment: point `TALLY_CONNECTOR_BASE_URL` at the tunnel hostname.
+8. ✅ **Tally products appear on the website** as hidden drafts ("From Tally" category) with
+   Tally's stock, price, GST, HSN and unit; the admin adds images/details and publishes. Tally can
+   hide a product but never publish one, so admin edits survive every sync.
+9. ✅ **Live end-to-end run** (`scripts/tally-live-e2e.ts` there): website routes + push loop +
+   this agent + a TallyPrime test company — 16/16, apart from the Sales Order below.
+10. ⬜ Deployment: merge the branch; point `TALLY_CONNECTOR_BASE_URL` at the tunnel hostname.
 
 ---
 

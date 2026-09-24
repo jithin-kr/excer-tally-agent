@@ -22,7 +22,8 @@ changes back, through a Cloudflare Tunnel so nothing is exposed. See [prd.md](pr
 | Thing | Where |
 |---|---|
 | Agent repo | GitHub `jithin-kr/excer-tally-agent`, branch **`main` only** (CI on every push) |
-| Website repo | `excer-global`, sibling folder; GitHub `sarath-velvetek/Excer-Global` |
+| Website repo | `excer-global`, sibling folder; GitHub `sarath-velvetek/Excer-Global`. Tally work on branch `fix/tally-agent-live-verification` (not yet merged); another developer works on `main` |
+| Live e2e check | `scripts/tally-live-e2e.ts` in the website repo (throwaway DB + this agent + test company) |
 | Handover PDF | `docs/Excer-Tally-Agent.pdf` (client-facing, dated 2026-09-16; predates the live-Tally verification — README is current) |
 | Detailed record | `README.md` ("Verified against a live TallyPrime"); website `CLAUDE.md` §20–§22, §39 |
 | Upstream licence notice | `NOTICE` — required by MIT for the five `src/tally/*` files |
@@ -56,6 +57,7 @@ changes back, through a Cloudflare Tunnel so nothing is exposed. See [prd.md](pr
 
 | Date | Decision |
 |---|---|
+| 2026-09-24 | Tally items appear on the website as hidden drafts; admin adds images/details and publishes; Tally can hide, never publish |
 | 2026-09-24 | Cancel by REMOTEID, never by voucher number (Optional vouchers share numbers) |
 | 2026-09-24 | Look up REMOTEID **before** writing; re-imports alter existing vouchers |
 | 2026-09-24 | Success only when Tally reports something written |

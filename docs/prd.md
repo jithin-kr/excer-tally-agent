@@ -61,6 +61,7 @@ anything twice:
 | R3 | Never make Tally visibly slow for the person using it | A two-stage check: a near-free counter, then only the rows that moved |
 | R4 | Survive restarts, restores and bad counters without silent stalls or full exports every tick | The office PC reboots; companies get restored from backup |
 | R5 | Send the item's GST rate, HSN, Tally unit and **selling** price (never cost) | The website prices and taxes from them |
+| R6 | Every Tally item reaches the website, where it appears as a hidden draft the admin completes and publishes | Client decision 2026-09-24: "show the Tally products on our website; I add images and details" |
 
 ### 3.3 Operations
 
