@@ -2,13 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [excer]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/excer' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
