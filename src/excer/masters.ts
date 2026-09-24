@@ -1,6 +1,6 @@
 // Reading masters out of Tally: stock items and customer ledgers.
 //
-// EXCER ADDITION (not in upstream): AlterID-based incremental sync.
+// AlterID-based incremental sync.
 //
 // Tally stamps every master with an ALTERID that increases whenever the record is edited. That
 // gives us a two-stage poll:

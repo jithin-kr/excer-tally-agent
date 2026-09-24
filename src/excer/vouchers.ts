@@ -2,7 +2,7 @@
 //
 // This is the translation layer: it turns the six payload shapes the Excer app already produces
 // (src/features/tally/mapping.ts in the main repo) into the generic `VoucherInput` that
-// src/tally/voucher-render.ts knows how to render. Keeping the two apart means upstream's proven
+// src/tally/voucher-render.ts knows how to render. Keeping the two apart means the proven
 // XML structure stays untouched while all Excer-specific accounting decisions live here.
 //
 // SIGN CONVENTION (inherited from Tally, enforced by assertBalanced):

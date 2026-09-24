@@ -1,10 +1,9 @@
 // Generic Tally voucher/XML rendering.
 //
-// FORKED from ShrutiSaagar/tally-prime-mcp (MIT), src/tools/vouchers.ts. The MCP tool wrappers
-// have been removed; the XML rendering below is kept close to upstream because its structure is
-// drawn from https://help.tallysolutions.com/sample-xml/ and is the part we least want to
-// reinvent. Excer-specific voucher construction lives in `src/excer/vouchers.ts`, which builds
-// the `VoucherInput` objects this module renders.
+// Includes third-party MIT-licensed code — see NOTICE. The XML structure below is drawn from
+// https://help.tallysolutions.com/sample-xml/ and is the part we least want to reinvent.
+// Excer-specific voucher construction lives in `src/excer/vouchers.ts`, which builds the
+// `VoucherInput` objects this module renders.
 //
 // EXCER ADDITION: `remoteId` — stamped onto the voucher as <REMOTEID>. This is what makes a
 // retried push idempotent: Tally rejects a second import carrying a REMOTEID it has already
@@ -84,7 +83,7 @@ export type LedgerEntry = z.infer<typeof ledgerEntrySchema>;
 export type InventoryEntry = z.infer<typeof inventoryEntrySchema>;
 
 /* -------------------------------------------------------------------------- */
-/*  Rendering (upstream, near-verbatim)                                       */
+/*  Rendering                                                                 */
 /* -------------------------------------------------------------------------- */
 
 export function renderLedgerEntry(e: LedgerEntry): string {

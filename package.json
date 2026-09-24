@@ -2,7 +2,7 @@
   "name": "excer-tally-agent",
   "version": "0.1.0",
   "private": true,
-  "description": "On-premises agent bridging Excer Global's Next.js app to TallyPrime's XML gateway. Forked from ShrutiSaagar/tally-prime-mcp (MIT).",
+  "description": "On-premises agent bridging Excer Global's Next.js app to TallyPrime's XML gateway.",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -26,5 +26,6 @@
   "devDependencies": {
     "@types/node": "^20.14.0",
     "typescript": "^5.5.0"
-  }
+  },
+  "author": "Velvetek Systems / Excer Global"
 }

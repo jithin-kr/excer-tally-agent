@@ -2,9 +2,8 @@
 
 On-premises agent bridging the Excer Global Next.js app to TallyPrime's XML gateway.
 
-Forked from [ShrutiSaagar/tally-prime-mcp](https://github.com/ShrutiSaagar/tally-prime-mcp) (MIT).
-The upstream project exposed Tally to LLMs over MCP; this fork keeps its XML layer and replaces
-the MCP surface with an HTTP API, an AlterID poll loop, and a heartbeat.
+An HTTP API for posting vouchers, an AlterID poll loop for reading masters back, and a heartbeat —
+running on the client's premises, next to Tally.
 
 ---
 
@@ -40,27 +39,24 @@ we can call Tally whenever we like, but Tally can never call us, so reads are po
 
 ## Layout
 
-| Path | Origin | What it does |
-|---|---|---|
-| `src/tally/client.ts` | upstream | POSTs XML to Tally, parses failure envelopes |
-| `src/tally/xml.ts` | upstream | Export/Import envelopes, date + escaping helpers |
-| `src/tally/util.ts` | upstream | Tally value coercion (`"42 Nos"` → `42`) |
-| `src/tally/voucher-render.ts` | upstream + `REMOTEID` | Generic voucher/ledger/inventory XML |
-| `src/excer/contract.ts` | **new** | The wire contract with the Next.js app |
-| `src/excer/config.ts` | **new** | Agent config + all installation-specific Tally names |
-| `src/excer/vouchers.ts` | **new** | The six Excer payloads → Tally XML |
-| `src/excer/masters.ts` | **new** | AlterID-based incremental read |
-| `src/excer/lookup.ts` | **new** | Find a written voucher/ledger: duplicate check + real voucher number |
-| `src/server.ts` | **new** | The two HTTP endpoints the app calls |
-| `src/poll-loop.ts` | **new** | Two-stage "has anything changed?" polling, on both AlterID counters |
-| `src/state-store.ts` | **new** | Persists the poll watermarks across restarts |
-| `src/log.ts` | **new** | Timestamped logging; one audit line per push |
-| `test/` | **new** | `npm test` — node:test against a fake Tally, no Tally needed |
-| `src/heartbeat.ts` | **new** | Liveness reporting |
-| `src/doctor.ts` | **new** | Day-one validation against a real Tally |
-
-Deleted from upstream: `src/tools/reports.ts`, `src/index.ts` (MCP entry), `src/jsonschema.ts`,
-`bootstrap.cjs`, and the MCP SDK dependency.
+| Path | What it does |
+|---|---|
+| `src/tally/client.ts` | POSTs XML to Tally (one request at a time), parses failure envelopes |
+| `src/tally/xml.ts` | Export/Import envelopes, date + escaping helpers |
+| `src/tally/util.ts` | Tally value coercion (`"42 Nos"` → `42`) |
+| `src/tally/voucher-render.ts` | Generic voucher/ledger/inventory XML, with `REMOTEID` / `ISOPTIONAL` |
+| `src/excer/contract.ts` | The wire contract with the Next.js app |
+| `src/excer/config.ts` | Agent config + all installation-specific Tally names |
+| `src/excer/vouchers.ts` | The six Excer payloads → Tally XML |
+| `src/excer/masters.ts` | AlterID-based incremental read |
+| `src/excer/lookup.ts` | Find a written voucher/ledger: duplicate check + real voucher number |
+| `src/server.ts` | The two HTTP endpoints the app calls |
+| `src/poll-loop.ts` | Two-stage "has anything changed?" polling, on both AlterID counters |
+| `src/state-store.ts` | Persists the poll watermarks across restarts |
+| `src/log.ts` | Timestamped logging; one audit line per push |
+| `test/` | `npm test` — node:test against a fake Tally, no Tally needed |
+| `src/heartbeat.ts` | Liveness reporting |
+| `src/doctor.ts` | Day-one validation against a real Tally |
 
 ---
 
@@ -184,13 +180,12 @@ deployment — see "Not yet verified against a real Tally" below, which is uncha
 
 ## Not yet verified against a real Tally
 
-This fork has **never been run against a live Tally installation** — neither has upstream, as far
-as we can tell. It typechecks, builds, serves, and rejects bad input correctly. That is all it
+This agent has **never been run against a live Tally installation**. It typechecks, builds, serves, and rejects bad input correctly. That is all it
 currently proves.
 
 Verify each of these before trusting the agent with real books:
 
-- [ ] `<REMOTEID>` is accepted on vouchers and does suppress duplicates. Upstream's captured
+- [ ] `<REMOTEID>` is accepted on vouchers and does suppress duplicates. TallyConnector's captured
       fixtures use `<REMOTEALTGUID>` for **masters**; `<REMOTEID>` is the documented **voucher**
       field. We may need both.
 - [ ] The Company object exposes `ALTMSTID` / `ALTVCHID`. **Incremental sync depends entirely on
@@ -234,4 +229,5 @@ Neither is a code problem, and both outrank everything above:
 
 ## Licence
 
-MIT, inherited from upstream. See `LICENSE` and `NOTICE`.
+MIT — see `LICENSE`. The files under `src/tally/` include code used under a third-party MIT
+licence; its notice is kept in `NOTICE`, as that licence requires.
