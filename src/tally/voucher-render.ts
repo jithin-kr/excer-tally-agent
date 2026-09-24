@@ -213,6 +213,11 @@ export function masterImportEnvelope(body: string, company?: string): string {
 /** Assert that a voucher's ledger entries balance, as Tally requires. */
 export function assertBalanced(entries: LedgerEntry[]): void {
   if (entries.length === 0) return;
+  // EXCER: `NaN > 0.01` is false, so without this a NaN amount would pass as "balanced".
+  const bad = entries.find((e) => !Number.isFinite(e.amount));
+  if (bad) {
+    throw new Error(`Voucher ledger entry for "${bad.ledger}" has a non-numeric amount (${bad.amount}).`);
+  }
   const total = entries.reduce((sum, e) => sum + e.amount, 0);
   if (Math.abs(total) > 0.01) {
     throw new Error(

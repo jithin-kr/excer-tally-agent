@@ -8,6 +8,7 @@
 
 import { TallyClient } from "./tally/client.js";
 import { getLastAlterIds, fetchLedgers, fetchStockItems } from "./excer/masters.js";
+import { findLedgerByName, findVoucherByRemoteId } from "./excer/lookup.js";
 
 function ok(label: string, detail = "") {
   console.log(`  PASS  ${label}${detail ? ` — ${detail}` : ""}`);
@@ -23,16 +24,20 @@ async function main() {
   console.log(`Company: ${client.config.defaultCompany ?? "(active company)"}\n`);
 
   let reachable = false;
+  let countersOk = true;
 
   // 1. Is anything listening, and is it Tally?
   try {
     const ids = await getLastAlterIds(client, client.config.defaultCompany);
     reachable = true;
     if (ids.masters === 0 && ids.vouchers === 0) {
-      console.log("  WARN  AlterID counters both returned 0.");
+      // A FAIL, not a warning: the poll loop refuses to run with zero counters (otherwise it
+      // would do a full export every 15s), so the agent cannot sync until this is fixed.
+      countersOk = false;
+      console.log("  FAIL  AlterID counters both returned 0.");
       console.log("        Either the company is empty, or the ALTMSTID/ALTVCHID field names");
-      console.log("        differ on this Tally build. Incremental sync depends on these —");
-      console.log("        inspect the raw XML before relying on the poll loop.");
+      console.log("        differ on this Tally build. The poll loop will not run until this");
+      console.log("        is fixed — inspect the raw XML and adjust getLastAlterIds().");
     } else {
       ok("Tally reachable, AlterID counters readable", `masters=${ids.masters} vouchers=${ids.vouchers}`);
     }
@@ -76,9 +81,32 @@ async function main() {
     fail("Customer ledgers readable", err);
   }
 
+  // 4. Do the idempotency / read-back lookups run? (Read-only: an id that cannot exist.)
+  //    Proves the queries are accepted; whether they FIND a real voucher is only provable by the
+  //    first push into a test company — its log line must show a vch= number, not "?".
+  try {
+    const probe = await findVoucherByRemoteId(
+      client,
+      "excer-doctor-probe-does-not-exist",
+      new Date().toISOString().slice(0, 10),
+      client.config.defaultCompany
+    );
+    if (probe) console.log("  WARN  Voucher lookup matched a probe id — the $RemoteID filter is being ignored.");
+    else ok("Voucher lookup by REMOTEID accepted");
+  } catch (err) {
+    fail("Voucher lookup by REMOTEID", err);
+  }
+  try {
+    const probe = await findLedgerByName(client, "excer-doctor-probe-does-not-exist", client.config.defaultCompany);
+    if (probe) console.log("  WARN  Ledger lookup matched a probe name — the $Name filter is being ignored.");
+    else ok("Ledger lookup by name accepted");
+  } catch (err) {
+    fail("Ledger lookup by name", err);
+  }
+
   console.log("\nRead path checked. Writes are NOT tested here on purpose —");
   console.log("post your first voucher manually into a TEST company, never the live one.\n");
-  process.exit(reachable ? 0 : 1);
+  process.exit(reachable && countersOk ? 0 : 1);
 }
 
 main().catch((err) => {

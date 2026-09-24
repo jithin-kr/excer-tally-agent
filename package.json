@@ -11,7 +11,8 @@
     "start": "node --env-file-if-exists=.env dist/index.js",
     "doctor": "node --env-file-if-exists=.env dist/doctor.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist dist-test",
+    "test": "tsc -p tsconfig.test.json && node --test \"dist-test/test/**/*.test.js\""
   },
   "engines": {
     "node": ">=20"

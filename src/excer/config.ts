@@ -6,6 +6,8 @@
 // place to land once the client's Tally person answers them. Nothing else in the agent should
 // hard-code a Tally voucher type or ledger name.
 
+import { resolve } from "node:path";
+
 export interface TallyNames {
   /** Voucher type names EXACTLY as configured in their Tally. §20.6 Q15. */
   salesOrderVoucherType: string;
@@ -41,6 +43,13 @@ export interface AgentConfig {
   pollIntervalMs: number;
   /** How often to report liveness to the app (ms). */
   heartbeatIntervalMs: number;
+  /**
+   * Minimum gap between full stock-balance refreshes triggered by voucher activity (ms). A refresh
+   * re-reads every item's closing balance, so on a busy day this caps how often we ask for it.
+   */
+  stockRefreshMinIntervalMs: number;
+  /** Where the poll watermarks are persisted across restarts. */
+  stateFile: string;
   /** Stable id for this agent instance. */
   agentId: string;
   /**
@@ -87,6 +96,9 @@ export function loadAgentConfig(): AgentConfig {
     appToken: process.env.EXCER_APP_TOKEN?.trim() || undefined,
     pollIntervalMs: int("POLL_INTERVAL_MS", 15_000),
     heartbeatIntervalMs: int("HEARTBEAT_INTERVAL_MS", 30_000),
+    stockRefreshMinIntervalMs: int("STOCK_REFRESH_MIN_INTERVAL_MS", 60_000),
+    // Relative to the working directory, which the installer sets to the repo root.
+    stateFile: resolve(process.env.AGENT_STATE_FILE?.trim() || "state/poll-state.json"),
     agentId: process.env.AGENT_ID?.trim() || "excer-tally-agent-1",
     postVouchersAsOptional: bool("TALLY_POST_VOUCHERS_AS_OPTIONAL", true),
     tallyNames: {

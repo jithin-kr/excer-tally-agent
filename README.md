@@ -50,8 +50,12 @@ we can call Tally whenever we like, but Tally can never call us, so reads are po
 | `src/excer/config.ts` | **new** | Agent config + all installation-specific Tally names |
 | `src/excer/vouchers.ts` | **new** | The six Excer payloads → Tally XML |
 | `src/excer/masters.ts` | **new** | AlterID-based incremental read |
+| `src/excer/lookup.ts` | **new** | Find a written voucher/ledger: duplicate check + real voucher number |
 | `src/server.ts` | **new** | The two HTTP endpoints the app calls |
-| `src/poll-loop.ts` | **new** | Two-stage "has anything changed?" polling |
+| `src/poll-loop.ts` | **new** | Two-stage "has anything changed?" polling, on both AlterID counters |
+| `src/state-store.ts` | **new** | Persists the poll watermarks across restarts |
+| `src/log.ts` | **new** | Timestamped logging; one audit line per push |
+| `test/` | **new** | `npm test` — node:test against a fake Tally, no Tally needed |
 | `src/heartbeat.ts` | **new** | Liveness reporting |
 | `src/doctor.ts` | **new** | Day-one validation against a real Tally |
 
@@ -82,45 +86,72 @@ Both mirror the dev fixture at `src/app/api/dev-fake-tally/` in the main repo, s
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| `GET` | `/health` | none | Liveness; reports whether Tally is reachable |
+| `GET` | `/health` | none / `x-api-key` | Liveness. Without the key: `{ ok, agentId, tallyReachable }` only (it is public through the tunnel). With the key: company, last poll, last error, watermarks. Never queries Tally itself — it reports the poll loop's last result |
 | `GET` | `/api/export/masters?sinceAlterId=N` | `x-api-key` | Stock items + customer ledgers |
 | `POST` | `/api/import/voucher` | `x-api-key` | Post one of the six voucher types |
 
 ### Idempotency
 
-Every voucher carries `<REMOTEID>`, built by `buildTallyRemoteId()` in the main app. On a retry
-the same REMOTEID is sent, Tally ignores the duplicate, and the agent returns
-`{ duplicate: true }` — which the app treats as **success**, because the voucher it wanted does
-exist in Tally. Without this, one flaky network moment produces two sales orders in a real
-client's books.
+Every voucher carries `<REMOTEID>`, built by `buildTallyRemoteId()` in the main app. Before
+writing, the agent looks the REMOTEID up in Tally (`src/excer/lookup.ts`); if the voucher is
+already there it returns `{ duplicate: true }` **without re-importing** — which the app treats as
+**success**, because the voucher it wanted does exist in Tally. Checking first matters because a
+re-import carrying a known REMOTEID may *alter* the existing voucher rather than be ignored, e.g.
+flipping one the accountant already converted to Regular back to Optional.
+
+New customer ledgers are checked by name. Same name + same REMOTEALTGUID is a duplicate; same name
+belonging to a **different** customer is a `409` — never reported as success.
+
+### Voucher numbers
+
+After a successful write the agent reads the voucher back and returns its real `GUID` and
+`VOUCHERNUMBER`. It used to return Tally's `LASTVCHID`, which is an internal id, not the voucher
+number — and the app sends that value back to cancel, so cancelling could hit a different order.
+If the read-back finds nothing, `voucherNumber` is omitted and the push log says so; cancelling
+that order then fails with a clear error rather than guessing.
+
+### Payload validation
+
+Every push body is validated with zod (`pushRequestSchema`, `src/excer/contract.ts`) before any
+XML is built. A malformed payload is a `400` listing each bad field. (Before this, a missing
+`grandTotal` became `NaN`, passed the balance check, and rendered `<AMOUNT>NaN</AMOUNT>`.)
+
+### Polling: two counters
+
+`ALTMSTID` moves when a master is edited; `ALTVCHID` moves when a voucher is entered. Stock levels
+change through **vouchers** — a purchase raises closing stock without editing the item master — so
+the loop watches both. A voucher change re-reads every item's closing balance, at most once per
+`STOCK_REFRESH_MIN_INTERVAL_MS` (default 60s). Watermarks are saved to `AGENT_STATE_FILE`, so a
+restart does not re-export everything. A counter going **backwards** (company restored from backup)
+triggers a full re-sync; both counters reading **0** stops the loop with an error, instead of a full
+export every tick. All Tally requests go through one queue — Tally serves one at a time.
 
 ---
 
-## Your one decision
+## The GST split decision — made 2026-09-23
 
-`splitGst()` in `src/excer/vouchers.ts` is **deliberately left unimplemented**. It throws.
-
-Everything else in this agent is mechanical translation, but this one is a judgement call about
-how the business actually operates, and getting it wrong misfiles tax in a client's books:
+`splitGst()` in `src/excer/vouchers.ts` was deliberately left unimplemented (it threw) until a
+Stage 1 test with the main app — no real Tally, just proving the wiring — surfaced that this
+blocks *every* taxed order, not an edge case, the moment a real connector exists. The client made
+the call the same day:
 
 Indian GST splits **CGST + SGST** for a sale inside your own state and **IGST** for a sale to
 another state. Excer is in Kerala. The function receives the tax total, what we know about the
 buyer (`gstin` and/or `state`), and the configured `homeState`.
 
-Three things to decide:
+1. **Free-text `state` always wins when present** — even when it disagrees with what the GSTIN's
+   state code would imply. The GSTIN is used only to *derive* a state when no free-text state is
+   on file at all (via the CBIC two-digit state code table in `vouchers.ts`).
+2. **Both missing, or an unrecognised GSTIN code with no state** → throws. Blocks the push until
+   someone fixes the customer's address/GSTIN in the admin panel — discovered today, not misfiled
+   in the client's books and discovered by an accountant months later. The job retries
+   automatically once the record is fixed (`MAX_AUTO_RETRY_ATTEMPTS`, main repo CLAUDE.md §22.10).
+3. **Rounding**: SGST is computed as the remainder (`taxTotal - cgst`), not independently rounded,
+   so the two halves always sum to exactly `taxTotal` regardless of an odd paisa — verified with a
+   ₹495.90 tax total (the real order that surfaced this) splitting to ₹247.95 / ₹247.95 exactly.
 
-1. **Which signal do you trust?** A GSTIN's first two digits are a government-issued state code
-   (`32` = Kerala) and can't be typo'd into a different *valid* state. But unregistered buyers
-   have no GSTIN and free-text `state` is all you get.
-2. **What if both are missing?** Defaulting to intra-state silently misfiles inter-state sales —
-   discovered by an accountant months later. Throwing blocks the push until someone fixes the
-   customer record — discovered in the admin panel today. Both are defensible; they fail in very
-   different places.
-3. **Rounding.** CGST and SGST are each half the total, and an odd number of paise won't split
-   evenly. Tally rejects a voucher whose entries don't balance to the paisa, so the two halves
-   must still sum to exactly `taxTotal`.
-
-About 8 lines. The doc comment on the function repeats all of this in place.
+The doc comment on the function repeats this in place. The cases (both decisions, the fallback,
+the conflict, rounding, and both throw paths) are in `test/vouchers.test.ts` — run `npm test`.
 
 ---
 
@@ -163,7 +194,14 @@ Verify each of these before trusting the agent with real books:
       fixtures use `<REMOTEALTGUID>` for **masters**; `<REMOTEID>` is the documented **voucher**
       field. We may need both.
 - [ ] The Company object exposes `ALTMSTID` / `ALTVCHID`. **Incremental sync depends entirely on
-      this.** `npm run doctor` warns if they come back as 0.
+      this.** `npm run doctor` fails if they come back as 0, and the poll loop refuses to run.
+- [ ] `ALTVCHID` moves when a voucher is entered, and a purchase voucher's stock change shows up on
+      the website within ~15s–60s.
+- [ ] The REMOTEID lookup (`$RemoteID` filter, `src/excer/lookup.ts`) finds a voucher we pushed —
+      **including an Optional one**. Proof: the first test-company push's log line shows
+      `vch=<number>`, not `vch=?`, and pushing the same payload again logs `duplicate`.
+- [ ] The ledger lookup returns `REMOTEALTGUID` for a ledger we created (otherwise a retried
+      new-customer push is a 409 instead of a duplicate).
 - [ ] `$AlterID > n` works as a collection `FILTER` on this Tally build.
 - [ ] Stock Journal XML — cable cuts may need `SOURCELIST`/`DESTINATIONLIST` rather than the flat
       `ALLINVENTORYENTRIES.LIST` this renders.

@@ -7,13 +7,26 @@
 // The heartbeat carries the last poll error too, so the common failures (Tally closed for the
 // night, company not open, backup running) are visible in the app without anyone opening a log
 // file on a machine we cannot reach.
+//
+// It reports what the poll loop last saw rather than asking Tally itself: the poll already checks
+// Tally every few seconds, and a second query every heartbeat is load on a program that serves
+// one request at a time, for no new information.
 
+import { readFileSync } from "node:fs";
 import type { AgentConfig } from "./excer/config.js";
 import type { TallyClient } from "./tally/client.js";
-import { getLastAlterIds } from "./excer/masters.js";
-import type { PollState } from "./poll-loop.js";
+import { postToApp, type PollState } from "./poll-loop.js";
 
-export const AGENT_VERSION = "0.1.0";
+/** Read from package.json so the version reported to the app can never drift from the release. */
+export const AGENT_VERSION: string = (() => {
+  try {
+    // dist/heartbeat.js -> ../package.json is the repo root in both src and dist layouts.
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    return String(pkg.version);
+  } catch {
+    return "unknown";
+  }
+})();
 
 export interface HeartbeatPayload {
   agentId: string;
@@ -26,31 +39,19 @@ export interface HeartbeatPayload {
   sentAt: string;
 }
 
-export async function buildHeartbeat(
+export function buildHeartbeat(
   config: AgentConfig,
   client: TallyClient,
   state: PollState
-): Promise<HeartbeatPayload> {
-  let tallyReachable = false;
-  let lastAlterId: number | null = null;
-  let error: string | null = state.lastError;
-
-  try {
-    const ids = await getLastAlterIds(client, client.config.defaultCompany);
-    tallyReachable = true;
-    lastAlterId = ids.masters;
-  } catch (err) {
-    error = err instanceof Error ? err.message : String(err);
-  }
-
+): HeartbeatPayload {
   return {
     agentId: config.agentId,
     agentVersion: AGENT_VERSION,
-    tallyReachable,
+    tallyReachable: state.tallyReachable,
     tallyCompany: client.config.defaultCompany ?? null,
-    lastAlterId,
+    lastAlterId: state.lastRunAt ? state.lastMasterAlterId : null,
     lastPollAt: state.lastRunAt,
-    lastError: error,
+    lastError: state.lastError,
     sentAt: new Date().toISOString(),
   };
 }
@@ -61,16 +62,8 @@ export function startHeartbeat(config: AgentConfig, client: TallyClient, state: 
   const tick = async () => {
     if (stopped) return;
     try {
-      const payload = await buildHeartbeat(config, client, state);
       if (config.appBaseUrl) {
-        await fetch(`${config.appBaseUrl}/api/tally/heartbeat`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(config.appToken ? { Authorization: `Bearer ${config.appToken}` } : {}),
-          },
-          body: JSON.stringify(payload),
-        });
+        await postToApp(config, "/api/tally/heartbeat", buildHeartbeat(config, client, state));
       }
     } catch {
       // A failed heartbeat is itself the signal — the app will notice the gap in lastSeenAt.
@@ -80,7 +73,8 @@ export function startHeartbeat(config: AgentConfig, client: TallyClient, state: 
     }
   };
 
-  setTimeout(tick, 1_000);
+  // A few seconds in, so the first heartbeat reports the first poll's result, not "unknown".
+  setTimeout(tick, 5_000);
   return () => {
     stopped = true;
   };

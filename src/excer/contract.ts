@@ -8,6 +8,8 @@
 // specification for both endpoints — this agent must be a drop-in replacement for it. If you
 // change a shape here, change it there too, or the mock stops proving anything.
 
+import { z } from "zod";
+
 /* -------------------------------------------------------------------------- */
 /*  Inbound: Tally -> Excer  (GET /api/export/masters)                        */
 /* -------------------------------------------------------------------------- */
@@ -51,112 +53,166 @@ export interface MastersResponse {
 /* -------------------------------------------------------------------------- */
 /*  Outbound: Excer -> Tally  (POST /api/import/voucher)                      */
 /* -------------------------------------------------------------------------- */
+//
+// These are zod schemas, not just interfaces, because the payload arrives over the network and a
+// TypeScript cast checks nothing at runtime. Before this, a payload missing `grandTotal` produced
+// `-undefined` = NaN, which slipped past the balance check (NaN > 0.01 is false) and would have
+// rendered <AMOUNT>NaN</AMOUNT> into the client's books. Now it is a 400 before any XML exists.
+//
+// Nullable fields use `.nullish()` (null OR absent) so an app that omits an optional field is
+// not rejected — only fields the voucher cannot be built without are strict.
 
-export type TallyJobType =
-  | "push_sales_order"
-  | "push_delivery_note"
-  | "push_credit_note"
-  | "push_new_ledger"
-  | "push_stock_journal"
-  | "push_cancel_sales_order";
+/** Money and quantities: must be a real number. NaN / Infinity never reach Tally. */
+const money = z.number().finite();
+const nonNegativeMoney = money.nonnegative();
 
-export interface LineItemPayload {
-  itemName: string;
-  itemGuid: string | null;
-  hsnCode?: string | null;
-  quantity: number;
-  unit?: string;
-  rate: number;
-  taxableValue: number;
-  gstRate: number | null;
-}
+/**
+ * The idempotency key. No double quotes: it is matched inside a TDL formula string when checking
+ * for an existing voucher (src/excer/lookup.ts), and TDL has no way to escape one.
+ */
+const remoteId = z
+  .string()
+  .min(1)
+  .max(200)
+  .refine((v) => !v.includes('"'), "remoteId must not contain a double quote");
 
-export interface SalesOrderPayload {
-  remoteId: string;
-  orderDate: string;
-  buyer: { ledgerGuid: string | null; ledgerName: string; gstin: string | null };
-  deliveryAddress: string;
-  lineItems: LineItemPayload[];
-  subtotal: number;
-  discountAmount: number;
-  taxableValue: number;
-  taxTotal: number;
-  grandTotal: number;
-  notes: string | null;
-}
+const date = z.string().min(1);
+const text = z.string().nullish();
 
-export interface DeliveryNotePayload {
-  remoteId: string;
-  referencedSalesOrderRemoteId: string;
-  dispatchDate: string;
-  lineItems: LineItemPayload[];
-  trackingNumber: string | null;
-  courierName: string | null;
+export const lineItemSchema = z.object({
+  itemName: z.string().min(1),
+  itemGuid: text,
+  hsnCode: text,
+  quantity: money.positive(),
+  unit: text,
+  rate: money,
+  taxableValue: money,
+  gstRate: money.nullish(),
+});
+
+export const salesOrderPayloadSchema = z.object({
+  remoteId,
+  orderDate: date,
+  buyer: z.object({
+    ledgerGuid: text,
+    ledgerName: z.string().min(1),
+    gstin: text,
+    /**
+     * Structural delivery state (`Order.deliveryState`, main repo CLAUDE.md §22.12) — used by
+     * `splitGst()` to pick CGST+SGST vs IGST. Null when checkout used free text or the legacy
+     * address blob, in which case `splitGst()` falls back to the GSTIN, or blocks with a clear
+     * error.
+     */
+    state: text,
+  }),
+  deliveryAddress: text,
+  lineItems: z.array(lineItemSchema).min(1),
+  subtotal: nonNegativeMoney,
+  discountAmount: nonNegativeMoney,
+  taxableValue: nonNegativeMoney,
+  taxTotal: nonNegativeMoney,
+  grandTotal: nonNegativeMoney,
+  notes: text,
+});
+
+export const deliveryNotePayloadSchema = z.object({
+  remoteId,
+  referencedSalesOrderRemoteId: z.string().min(1),
+  dispatchDate: date,
+  lineItems: z.array(lineItemSchema).min(1),
+  trackingNumber: text,
+  courierName: text,
   /** Resolved by the app from Order.tallyVoucherNumber so we can reference the Sales Order. */
-  referencedVoucherNumber?: string | null;
+  referencedVoucherNumber: text,
   /** Party ledger — needed because a Delivery Note still posts against the customer. */
-  buyerLedgerName?: string | null;
-}
+  buyerLedgerName: text,
+});
 
-export interface CreditNotePayload {
-  remoteId: string;
-  referencedRemoteId: string;
-  returnDate: string;
-  lineItems: Array<Omit<LineItemPayload, "hsnCode" | "unit">>;
-  totalCreditAmount: number;
-  reason: string | null;
-  buyerLedgerName?: string | null;
+export const creditNotePayloadSchema = z.object({
+  remoteId,
+  referencedRemoteId: z.string().min(1),
+  returnDate: date,
+  lineItems: z.array(lineItemSchema.omit({ hsnCode: true, unit: true })).min(1),
+  totalCreditAmount: nonNegativeMoney,
+  reason: text,
+  /** Required: a credit note posts against the customer, and Tally rejects an empty party. */
+  buyerLedgerName: z.string().min(1),
   /** Needed to decide CGST+SGST vs IGST on the reversal. See "Required changes in the main app". */
-  buyerGstin?: string | null;
-}
+  buyerGstin: text,
+  /** Structural delivery state (§22.12) — same fallback rules as `SalesOrderPayload.buyer.state`. */
+  buyerState: text,
+});
 
-export interface NewLedgerPayload {
-  remoteId: string;
-  customerName: string;
-  gstin: string | null;
-  address: string | null;
-  state: string | null;
-  phone: string | null;
-}
+export const newLedgerPayloadSchema = z.object({
+  remoteId,
+  customerName: z.string().min(1),
+  gstin: text,
+  address: text,
+  state: text,
+  phone: text,
+});
 
-export interface StockJournalPayload {
-  remoteId: string;
-  itemName: string;
-  itemGuid: string | null;
-  rollBarcode: string;
-  cutLength: number;
-  unit: string;
-  remainingLength: number;
-  date: string;
-}
+export const stockJournalPayloadSchema = z.object({
+  remoteId,
+  itemName: z.string().min(1),
+  itemGuid: text,
+  rollBarcode: z.string().min(1),
+  cutLength: money.positive(),
+  unit: z.string().min(1),
+  remainingLength: money.nonnegative(),
+  date,
+});
 
-export interface CancelSalesOrderPayload {
-  remoteId: string;
-  referencedSalesOrderRemoteId: string;
-  cancellationDate: string;
-  reason: string | null;
+export const cancelSalesOrderPayloadSchema = z.object({
+  remoteId,
+  referencedSalesOrderRemoteId: z.string().min(1),
+  cancellationDate: date,
+  reason: text,
   /**
    * Tally cancels a voucher by its voucher NUMBER, not by REMOTEID. The app stores this on
-   * Order.tallyVoucherNumber when the Sales Order push succeeds, but the current
-   * `buildCancelVoucherPayload` in the main repo does not send it — see the README's
-   * "Required change in the main app". Without it we cannot cancel and return a clear error.
+   * Order.tallyVoucherNumber from the `voucherNumber` this agent returns when the Sales Order
+   * push succeeds. Left optional here so a missing one produces buildCancelSalesOrderXml's
+   * specific error message rather than a generic validation failure.
    */
-  salesOrderVoucherNumber?: string | null;
-}
+  salesOrderVoucherNumber: text,
+});
 
-export type VoucherPayload =
-  | SalesOrderPayload
-  | DeliveryNotePayload
-  | CreditNotePayload
-  | NewLedgerPayload
-  | StockJournalPayload
-  | CancelSalesOrderPayload;
+export type LineItemPayload = z.infer<typeof lineItemSchema>;
+export type SalesOrderPayload = z.infer<typeof salesOrderPayloadSchema>;
+export type DeliveryNotePayload = z.infer<typeof deliveryNotePayloadSchema>;
+export type CreditNotePayload = z.infer<typeof creditNotePayloadSchema>;
+export type NewLedgerPayload = z.infer<typeof newLedgerPayloadSchema>;
+export type StockJournalPayload = z.infer<typeof stockJournalPayloadSchema>;
+export type CancelSalesOrderPayload = z.infer<typeof cancelSalesOrderPayloadSchema>;
+
+/**
+ * The whole POST body: the payload fields plus a `type` that says which of the six it is.
+ * A discriminated union, so after parsing, `switch (req.type)` narrows the payload for free.
+ */
+export const pushRequestSchema = z.discriminatedUnion("type", [
+  salesOrderPayloadSchema.extend({ type: z.literal("push_sales_order") }),
+  deliveryNotePayloadSchema.extend({ type: z.literal("push_delivery_note") }),
+  creditNotePayloadSchema.extend({ type: z.literal("push_credit_note") }),
+  newLedgerPayloadSchema.extend({ type: z.literal("push_new_ledger") }),
+  stockJournalPayloadSchema.extend({ type: z.literal("push_stock_journal") }),
+  cancelSalesOrderPayloadSchema.extend({ type: z.literal("push_cancel_sales_order") }),
+]);
+
+export type PushRequest = z.infer<typeof pushRequestSchema>;
+export type TallyJobType = PushRequest["type"];
 
 /** What the app's `pushTallyVoucher()` expects back. */
 export interface PushResponse {
   success?: boolean;
   duplicate?: boolean;
+  /** Tally's GUID for the voucher or ledger, read back after writing. */
   guid?: string;
+  /**
+   * The voucher's real VOUCHERNUMBER, read back after writing — the app stores it as
+   * Order.tallyVoucherNumber and later sends it to cancel. Absent when Tally assigned none (e.g.
+   * an Optional voucher on a build that numbers only on conversion), in which case cancelling
+   * that order fails with a clear error instead of hitting the wrong voucher.
+   */
   voucherNumber?: string;
   error?: string;
   [key: string]: unknown;

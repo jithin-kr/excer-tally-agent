@@ -8,13 +8,18 @@
 // Uses node:http directly rather than Express — two routes do not justify a framework, and
 // fewer dependencies means fewer things to patch on a machine we cannot easily reach.
 
+import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AgentConfig } from "./excer/config.js";
 import type { TallyClient } from "./tally/client.js";
-import { buildVoucherXml } from "./excer/vouchers.js";
-import { fetchLedgers, fetchStockItems, getLastAlterIds } from "./excer/masters.js";
+import { buildVoucherXml, voucherDate } from "./excer/vouchers.js";
+import { fetchLedgers, fetchStockItems } from "./excer/masters.js";
+import { findLedgerByName, findVoucherByRemoteId, type VoucherIdentity } from "./excer/lookup.js";
 import { parseImportResult } from "./tally/xml.js";
-import type { PushResponse, TallyJobType } from "./excer/contract.js";
+import { pushRequestSchema, type PushRequest, type PushResponse } from "./excer/contract.js";
+import type { PollState } from "./poll-loop.js";
+import { AGENT_VERSION } from "./heartbeat.js";
+import { errorMessage, log } from "./log.js";
 
 function json(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
@@ -39,47 +44,176 @@ async function readJsonBody(req: IncomingMessage): Promise<any> {
 }
 
 /**
+ * Compare the presented API key in constant time. Hashing both sides first makes the buffers the
+ * same length, so neither the content nor the length of the real key leaks through timing.
+ */
+export function isAuthorized(presented: string | string[] | undefined, apiKey: string): boolean {
+  if (typeof presented !== "string") return false;
+  const digest = (v: string) => createHash("sha256").update(v).digest();
+  return timingSafeEqual(digest(presented), digest(apiKey));
+}
+
+/**
  * Decide whether Tally's import response means "you already sent me this voucher".
  *
- * Tally has no dedicated duplicate status. When it sees a REMOTEID it already holds, it ignores
- * the row rather than creating it. So: nothing created or altered, but something ignored, is our
- * duplicate signal — and the app treats duplicate as SUCCESS, never an error, because the
- * voucher it wanted does exist in Tally. That is the whole point of stamping REMOTEID.
+ * This is the fallback — the primary duplicate check is the REMOTEID lookup BEFORE sending (see
+ * handlePush). It catches the narrow race where two retries of the same job arrive together.
+ *
+ * Deliberately NOT matched: "already exists". For a new customer ledger that message means a
+ * DIFFERENT customer already has this name — treating it as success would link the app's customer
+ * to someone else's ledger. The ledger path handles that case explicitly with a 409.
  */
-function looksLikeDuplicate(result: ReturnType<typeof parseImportResult>): boolean {
+export function looksLikeDuplicate(result: ReturnType<typeof parseImportResult>): boolean {
   const nothingWritten = result.created === 0 && result.altered === 0 && result.combined === 0;
   const wasIgnored = result.ignored > 0;
-  const saysDuplicate = /duplicate|already exists/i.test(result.lineError ?? "");
+  const saysDuplicate = /duplicate/i.test(result.lineError ?? "");
   return (nothingWritten && wasIgnored) || saysDuplicate;
 }
 
-export function createAgentServer(config: AgentConfig, client: TallyClient) {
+function isVoucher(req: PushRequest): boolean {
+  return req.type !== "push_new_ledger" && req.type !== "push_cancel_sales_order";
+}
+
+/** An error the caller must fix, carrying the HTTP status to answer with. */
+class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string
+  ) {
+    super(message);
+  }
+}
+
+export function createAgentServer(config: AgentConfig, client: TallyClient, poll: PollState) {
   const state = { lastPushAt: null as string | null, lastPullAt: null as string | null };
+  const company = client.config.defaultCompany;
+
+  /** Look up what we wrote, so the app gets Tally's real GUID and voucher number. */
+  async function readBack(req: PushRequest): Promise<VoucherIdentity | null> {
+    if (req.type === "push_new_ledger") {
+      const ledger = await findLedgerByName(client, req.customerName, company);
+      return ledger ? { guid: ledger.guid, voucherNumber: null } : null;
+    }
+    const date = voucherDate(req);
+    if (!date) return null;
+    return findVoucherByRemoteId(client, req.remoteId, date, company);
+  }
+
+  async function handlePush(req: PushRequest): Promise<{ status: number; body: PushResponse }> {
+    // ── 1. Already in Tally? Answer without writing. ──────────────────────
+    // Checked BEFORE sending because re-importing a known REMOTEID may alter the existing
+    // voucher instead of being ignored — e.g. flipping one the accountant already converted to
+    // Regular back to Optional. A retry must never touch what is already there.
+    if (req.type === "push_new_ledger") {
+      const existing = await findLedgerByName(client, req.customerName, company);
+      if (existing) {
+        if (existing.remoteAltGuid === req.remoteId) {
+          return { status: 200, body: { success: true, duplicate: true, remoteId: req.remoteId, guid: existing.guid } };
+        }
+        throw new HttpError(
+          409,
+          `A different ledger named "${req.customerName}" already exists in Tally. Rename the ` +
+            `customer in the admin panel, or link it to the existing Tally ledger, then retry.`
+        );
+      }
+    } else if (isVoucher(req)) {
+      const existing = await readBack(req);
+      if (existing) {
+        return {
+          status: 200,
+          body: {
+            success: true,
+            duplicate: true,
+            remoteId: req.remoteId,
+            guid: existing.guid,
+            voucherNumber: existing.voucherNumber ?? undefined,
+          },
+        };
+      }
+    }
+
+    // ── 2. Write. ─────────────────────────────────────────────────────────
+    const xml = buildVoucherXml(req, config.tallyNames, company, config.postVouchersAsOptional);
+    const result = parseImportResult(await client.send(xml));
+
+    if (looksLikeDuplicate(result)) {
+      const existing = await readBack(req).catch(() => null);
+      return {
+        status: 200,
+        body: {
+          success: true,
+          duplicate: true,
+          remoteId: req.remoteId,
+          guid: existing?.guid,
+          voucherNumber: existing?.voucherNumber ?? undefined,
+        },
+      };
+    }
+
+    if (result.errors > 0 || result.lineError) {
+      return {
+        status: 422,
+        body: { success: false, error: result.lineError ?? "Tally rejected the voucher", tallyResult: result },
+      };
+    }
+
+    // ── 3. Read back the real identifiers. ────────────────────────────────
+    // NOT result.lastVchId: that is Tally's internal id, not the voucher number, and cancelling
+    // by it could cancel a different order.
+    let identity: VoucherIdentity | null = null;
+    if (req.type !== "push_cancel_sales_order") {
+      try {
+        identity = await readBack(req);
+      } catch (err) {
+        log.warn("push", `${req.type} ${req.remoteId}: written, but read-back failed: ${errorMessage(err)}`);
+      }
+      if (!identity) {
+        log.warn(
+          "push",
+          `${req.type} ${req.remoteId}: written, but not found by read-back — no voucher number ` +
+            `returned, so cancelling it later will need doing by hand in Tally.`
+        );
+      }
+    }
+
+    state.lastPushAt = new Date().toISOString();
+    return {
+      status: 200,
+      body: {
+        success: true,
+        guid: identity?.guid || undefined,
+        voucherNumber: identity?.voucherNumber ?? undefined,
+        tallyResult: result,
+      },
+    };
+  }
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://localhost:${config.port}`);
+    const authorized = isAuthorized(req.headers["x-api-key"], config.apiKey);
 
-    // Liveness probe — deliberately unauthenticated so a tunnel health check can use it.
+    // Liveness probe. Unauthenticated so a tunnel health check can use it — which also means it is
+    // public on the internet, so without the key it says only whether we are up. The details
+    // (company name, Tally URL, raw error text) are for callers holding the key.
+    // Reads the poll loop's last result instead of querying Tally: a health checker hitting this
+    // every few seconds must not become extra load on Tally.
     if (req.method === "GET" && url.pathname === "/health") {
-      let tallyReachable = false;
-      let tallyError: string | undefined;
-      try {
-        await getLastAlterIds(client, client.config.defaultCompany);
-        tallyReachable = true;
-      } catch (err) {
-        tallyError = err instanceof Error ? err.message : String(err);
-      }
+      const summary = { ok: true, agentId: config.agentId, tallyReachable: poll.tallyReachable };
+      if (!authorized) return json(res, 200, summary);
       return json(res, 200, {
-        agentId: config.agentId,
-        tallyReachable,
-        tallyError,
+        ...summary,
+        agentVersion: AGENT_VERSION,
         tallyUrl: client.config.url,
-        company: client.config.defaultCompany ?? null,
+        company: company ?? null,
+        lastPollAt: poll.lastRunAt,
+        lastError: poll.lastError,
+        lastMasterAlterId: poll.lastMasterAlterId,
+        lastVoucherAlterId: poll.lastVoucherAlterId,
         ...state,
       });
     }
 
-    if (req.headers["x-api-key"] !== config.apiKey) {
+    if (!authorized) {
       return json(res, 401, { error: "Invalid API key" });
     }
 
@@ -87,11 +221,8 @@ export function createAgentServer(config: AgentConfig, client: TallyClient) {
     if (req.method === "GET" && url.pathname === "/api/export/masters") {
       try {
         const since = Number.parseInt(url.searchParams.get("sinceAlterId") ?? "0", 10) || 0;
-        const company = client.config.defaultCompany;
-        const [stockItems, ledgers] = await Promise.all([
-          fetchStockItems(client, since, company),
-          fetchLedgers(client, since, company, config.tallyNames.customerParentGroup),
-        ]);
+        const stockItems = await fetchStockItems(client, since, company);
+        const ledgers = await fetchLedgers(client, since, company, config.tallyNames.customerParentGroup);
         const maxAlterId = Math.max(
           since,
           ...stockItems.map((r) => r.alterId),
@@ -100,62 +231,45 @@ export function createAgentServer(config: AgentConfig, client: TallyClient) {
         state.lastPullAt = new Date().toISOString();
         return json(res, 200, { stockItems, ledgers, maxAlterId });
       } catch (err) {
-        return json(res, 502, { error: err instanceof Error ? err.message : String(err) });
+        return json(res, 502, { error: errorMessage(err) });
       }
     }
 
     // ── Write: one voucher ───────────────────────────────────────────────
     if (req.method === "POST" && url.pathname === "/api/import/voucher") {
-      let body: any;
+      let body: unknown;
       try {
         body = await readJsonBody(req);
       } catch (err) {
-        return json(res, 400, { error: err instanceof Error ? err.message : "Invalid JSON" });
+        return json(res, 400, { success: false, error: err instanceof Error ? err.message : "Invalid JSON" });
       }
 
-      const type = body?.type as TallyJobType | undefined;
-      const remoteId = body?.remoteId as string | undefined;
-      if (!type) return json(res, 400, { error: "type is required" });
-      if (!remoteId) return json(res, 400, { error: "remoteId is required" });
+      // Validate the shape before any XML exists. A 400 here is a bug in the app's payload
+      // builder, not something a retry will fix.
+      const parsed = pushRequestSchema.safeParse(body);
+      if (!parsed.success) {
+        const issues = parsed.error.issues.map((i) => `${i.path.join(".") || "(body)"}: ${i.message}`);
+        log.warn("push", `rejected invalid payload: ${issues.join("; ")}`);
+        return json(res, 400, { success: false, error: "Invalid payload", issues });
+      }
+      const pushReq = parsed.data;
 
       try {
-        const xml = buildVoucherXml(
-          type,
-          body,
-          config.tallyNames,
-          client.config.defaultCompany,
-          config.postVouchersAsOptional
+        const { status, body: out } = await handlePush(pushReq);
+        // One line per write attempt: the audit trail for "did the agent post this?".
+        log.info(
+          "push",
+          `${pushReq.type} ${pushReq.remoteId} -> ${status} ` +
+            (out.duplicate ? "duplicate " : out.success ? "created " : "rejected ") +
+            (out.success
+              ? `guid=${out.guid ?? "?"} vch=${out.voucherNumber ?? "?"}`
+              : String(out.error ?? ""))
         );
-        const responseXml = await client.send(xml);
-        const result = parseImportResult(responseXml);
-
-        if (looksLikeDuplicate(result)) {
-          const dup: PushResponse = { success: true, duplicate: true, remoteId };
-          return json(res, 200, dup);
-        }
-
-        if (result.errors > 0 || result.lineError) {
-          return json(res, 422, {
-            success: false,
-            error: result.lineError ?? "Tally rejected the voucher",
-            tallyResult: result,
-          });
-        }
-
-        state.lastPushAt = new Date().toISOString();
-        const ok: PushResponse = {
-          success: true,
-          // Tally returns the internal id of the last written voucher/master.
-          guid: result.lastVchId ? String(result.lastVchId) : String(result.lastMId || ""),
-          voucherNumber: result.lastVchId ? String(result.lastVchId) : undefined,
-          tallyResult: result,
-        };
-        return json(res, 200, ok);
+        return json(res, status, out);
       } catch (err) {
-        return json(res, 502, {
-          success: false,
-          error: err instanceof Error ? err.message : String(err),
-        });
+        const status = err instanceof HttpError ? err.status : 502;
+        log.warn("push", `${pushReq.type} ${pushReq.remoteId} -> ${status} ${errorMessage(err)}`);
+        return json(res, status, { success: false, error: errorMessage(err) });
       }
     }
 

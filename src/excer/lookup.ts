@@ -1,0 +1,110 @@
+// Finding records we have already written to Tally.
+//
+// EXCER ADDITION. Two jobs:
+//
+//   1. Idempotency BEFORE writing. Checking "does a voucher with this REMOTEID already exist?"
+//      before sending means a retry never reaches Tally's import at all. That matters because a
+//      re-import carrying a known REMOTEID may *alter* the existing voucher rather than be
+//      ignored — and altering it would, for example, flip a voucher the accountant has already
+//      converted to Regular back to Optional.
+//
+//   2. Real identifiers AFTER writing. Tally's import response reports LASTVCHID, which is its
+//      internal master id — NOT the voucher number. Cancelling by voucher number with that value
+//      could cancel a different order. So after a successful import we read the voucher back by
+//      REMOTEID and return its actual GUID and VOUCHERNUMBER.
+//
+// UNVERIFIED against a live Tally: the `$RemoteID` / `$RemoteAltGUID` method names, and whether a
+// Voucher collection includes Optional vouchers. `npm run doctor` runs both lookups read-only;
+// the first test-company push confirms the round-trip.
+
+import type { TallyClient } from "../tally/client.js";
+import { buildExportCollectionEnvelope, escapeXml, parseTallyXmlAsStrings } from "../tally/xml.js";
+import { asArray, s } from "../tally/util.js";
+
+/**
+ * Quote a value for a TDL formula. TDL string literals have no escape for `"`, so a value
+ * containing one cannot be matched safely — refuse it rather than build a broken filter.
+ */
+function tdlString(value: string): string {
+  if (value.includes('"')) {
+    throw new Error(`Cannot look up ${JSON.stringify(value)} in Tally: it contains a double quote.`);
+  }
+  return `"${escapeXml(value)}"`;
+}
+
+function collectionRows(xml: string, tag: string): any[] {
+  const tree = parseTallyXmlAsStrings(xml);
+  const collection = tree?.ENVELOPE?.BODY?.DATA?.COLLECTION ?? tree?.ENVELOPE?.BODY?.DATA ?? {};
+  return asArray(collection?.[tag]);
+}
+
+export interface VoucherIdentity {
+  guid: string;
+  voucherNumber: string | null;
+}
+
+/**
+ * Find a voucher by the REMOTEID we stamped on it.
+ *
+ * Scoped to the voucher's own date (SVFROMDATE = SVTODATE = date): Voucher collections are bounded
+ * by the period, so this scans one day's vouchers instead of the whole company's history.
+ */
+export async function findVoucherByRemoteId(
+  client: TallyClient,
+  remoteId: string,
+  date: string,
+  company?: string
+): Promise<VoucherIdentity | null> {
+  const xml = buildExportCollectionEnvelope({
+    collectionName: "ExcerVoucherByRemoteId",
+    staticVariables: { company, fromDate: date, toDate: date },
+    tdlMessage: `
+      <COLLECTION NAME="ExcerVoucherByRemoteId" ISMODIFY="No">
+        <TYPE>Voucher</TYPE>
+        <FETCH>GUID</FETCH>
+        <FETCH>VoucherNumber</FETCH>
+        <FETCH>RemoteID</FETCH>
+        <FILTER>ExcerMatchRemoteId</FILTER>
+      </COLLECTION>
+      <SYSTEM TYPE="Formulae" NAME="ExcerMatchRemoteId">$RemoteID = ${tdlString(remoteId)}</SYSTEM>`,
+  });
+  const row = collectionRows(await client.send(xml), "VOUCHER")[0];
+  if (!row) return null;
+  return {
+    guid: s(row.GUID ?? row["@_GUID"]),
+    voucherNumber: s(row.VOUCHERNUMBER) || null,
+  };
+}
+
+export interface LedgerIdentity {
+  guid: string;
+  /** The REMOTEALTGUID we stamped when creating it; empty for ledgers created inside Tally. */
+  remoteAltGuid: string;
+}
+
+/** Find a ledger by name. Tally ledger names are unique (case-insensitively) within a company. */
+export async function findLedgerByName(
+  client: TallyClient,
+  name: string,
+  company?: string
+): Promise<LedgerIdentity | null> {
+  const xml = buildExportCollectionEnvelope({
+    collectionName: "ExcerLedgerByName",
+    staticVariables: { company },
+    tdlMessage: `
+      <COLLECTION NAME="ExcerLedgerByName" ISMODIFY="No">
+        <TYPE>Ledger</TYPE>
+        <FETCH>GUID</FETCH>
+        <FETCH>Name</FETCH>
+        <FETCH>RemoteAltGUID</FETCH>
+        <FILTER>ExcerMatchLedgerName</FILTER>
+      </COLLECTION>
+      <SYSTEM TYPE="Formulae" NAME="ExcerMatchLedgerName">$Name = ${tdlString(name)}</SYSTEM>`,
+  });
+  const row = collectionRows(await client.send(xml), "LEDGER")[0];
+  if (!row) return null;
+  return {
+    guid: s(row.GUID ?? row["@_GUID"]),
+    remoteAltGuid: s(row.REMOTEALTGUID ?? row["@_REMOTEALTGUID"]),
+  };
+}

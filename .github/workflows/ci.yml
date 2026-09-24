@@ -35,6 +35,11 @@ jobs:
       - name: Build
         run: npm run build
 
+      # GST split, payload validation, voucher XML, duplicate handling and the poll loop's
+      # counter logic — all against a fake Tally, since there is no Tally on a runner.
+      - name: Test
+        run: npm test
+
       # The agent's own start-up path: a config error here means the Windows
       # Service would fail to boot on the client's machine, where nobody is
       # watching a terminal. Cheap to catch in CI instead.

@@ -5,10 +5,27 @@ import { loadConfig, TallyConfig } from "./config.js";
 import { isFailureEnvelope, parseTallyXml } from "./xml.js";
 
 export class TallyClient {
+  /**
+   * EXCER ADDITION: every request is queued behind the previous one.
+   *
+   * Tally handles one request at a time per company, and a heavy one freezes the operator's
+   * screen. The poll loop, the voucher pushes and the doctor all share this client, so this chain
+   * is the single place that guarantees we never stack requests on top of each other.
+   */
+  private queue: Promise<unknown> = Promise.resolve();
+
   constructor(public readonly config: TallyConfig = loadConfig()) {}
 
-  /** POST a Tally XML envelope and return the raw response body. */
-  async send(xml: string): Promise<string> {
+  /** POST a Tally XML envelope and return the raw response body. Requests run one at a time. */
+  send(xml: string): Promise<string> {
+    const next = this.queue.then(() => this.sendNow(xml));
+    // Keep the chain alive after a failure — one rejected request must not poison the rest.
+    this.queue = next.catch(() => undefined);
+    return next;
+  }
+
+  private async sendNow(xml: string): Promise<string> {
+    // The timeout starts when the request actually goes out, not while it waits in the queue.
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {

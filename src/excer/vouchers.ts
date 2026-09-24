@@ -15,9 +15,9 @@ import type {
   CreditNotePayload,
   DeliveryNotePayload,
   NewLedgerPayload,
+  PushRequest,
   SalesOrderPayload,
   StockJournalPayload,
-  TallyJobType,
 } from "./contract.js";
 import { escapeXml } from "../tally/xml.js";
 import {
@@ -49,32 +49,111 @@ export interface BuyerTaxIdentity {
 }
 
 /**
+ * Official two-digit GST state/UT codes -> canonical state name (CBIC list). Used only as a
+ * fallback to derive a buyer's state from their GSTIN when no free-text state is on file — see
+ * `splitGst` below.
+ */
+const GST_STATE_CODES: Record<string, string> = {
+  "01": "Jammu and Kashmir",
+  "02": "Himachal Pradesh",
+  "03": "Punjab",
+  "04": "Chandigarh",
+  "05": "Uttarakhand",
+  "06": "Haryana",
+  "07": "Delhi",
+  "08": "Rajasthan",
+  "09": "Uttar Pradesh",
+  "10": "Bihar",
+  "11": "Sikkim",
+  "12": "Arunachal Pradesh",
+  "13": "Nagaland",
+  "14": "Manipur",
+  "15": "Mizoram",
+  "16": "Tripura",
+  "17": "Meghalaya",
+  "18": "Assam",
+  "19": "West Bengal",
+  "20": "Jharkhand",
+  "21": "Odisha",
+  "22": "Chhattisgarh",
+  "23": "Madhya Pradesh",
+  "24": "Gujarat",
+  "26": "Dadra and Nagar Haveli and Daman and Diu",
+  "27": "Maharashtra",
+  "28": "Andhra Pradesh",
+  "29": "Karnataka",
+  "30": "Goa",
+  "31": "Lakshadweep",
+  "32": "Kerala",
+  "33": "Tamil Nadu",
+  "34": "Puducherry",
+  "35": "Andaman and Nicobar Islands",
+  "36": "Telangana",
+  "37": "Andhra Pradesh",
+  "38": "Ladakh",
+  "97": "Other Territory",
+  "99": "Centre Jurisdiction",
+};
+
+function normalizeState(state: string): string {
+  return state.trim().toLowerCase();
+}
+
+function stateFromGstin(gstin: string): string | null {
+  const code = gstin.trim().slice(0, 2);
+  return GST_STATE_CODES[code] ?? null;
+}
+
+/** Same rounding convention as the main app's `roundMoney` (`features/orders/approval.ts`). */
+function roundMoney(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+/**
  * Split a total tax amount into CGST / SGST / IGST ledger postings.
- *
- * TODO(excer): implement this — see "Your one decision" in the README.
  *
  * Indian GST splits one way for a sale inside your own state (CGST + SGST, half each) and
  * another way for a sale to a different state (IGST, all of it). Excer is in Kerala
  * (`names.homeState`), so a Kerala buyer is intra-state and a Tamil Nadu buyer is not.
  *
- * Things worth deciding deliberately:
- *   - Which signal do you trust? A GSTIN's first two digits are a government-issued state code
- *     and cannot be typo'd into a different valid state the way free text can. But unregistered
- *     buyers have no GSTIN at all, and `state` is all you get.
- *   - What happens when BOTH are missing or unrecognised? Defaulting to intra-state silently
- *     mis-files inter-state sales; throwing blocks the push until someone fixes the customer
- *     record. Both are defensible and they fail in very different places — one on the
- *     accountant's desk months later, one in the admin panel today.
- *   - Rounding. CGST and SGST are each half the total, and an odd number of paise will not
- *     split evenly. Tally rejects a voucher whose entries do not balance to the paisa, so the
- *     two halves must still sum to exactly `taxTotal`.
+ * Two decisions made deliberately on 2026-09-23, after this exact function blocked a real order
+ * during Stage 1 testing (every taxed order hits this, not just an edge case):
+ *
+ *   1. **Free-text `state` always wins when present** — including when it disagrees with what
+ *      the GSTIN's state code would imply. The GSTIN is only used as a *fallback* to derive a
+ *      state when no free-text state is on file at all.
+ *   2. **Both missing or the GSTIN's code is unrecognised → throw.** Blocks the push until
+ *      someone fixes the customer's address/GSTIN, rather than silently guessing intra-state and
+ *      letting an accountant discover a misfiled inter-state sale months later. The job retries
+ *      automatically (`MAX_AUTO_RETRY_ATTEMPTS`, main repo) once the record is fixed.
+ *
+ * Rounding: CGST and SGST are each half of `taxTotal`; an odd paisa can't split evenly, so SGST
+ * is computed as the remainder (`taxTotal - cgst`) rather than independently rounded, guaranteeing
+ * the two halves still sum to exactly `taxTotal` — Tally rejects a voucher whose entries don't
+ * balance to the paisa.
  */
-export function splitGst(
-  _taxTotal: number,
-  _buyer: BuyerTaxIdentity,
-  _names: TallyNames
-): GstSplit {
-  throw new Error("splitGst() is not implemented yet — see src/excer/vouchers.ts");
+export function splitGst(taxTotal: number, buyer: BuyerTaxIdentity, names: TallyNames): GstSplit {
+  const resolvedState =
+    (buyer.state && buyer.state.trim()) || (buyer.gstin && stateFromGstin(buyer.gstin)) || null;
+
+  if (!resolvedState) {
+    throw new Error(
+      "Cannot determine the buyer's state for the GST split: no state on file, and either no " +
+        "GSTIN or an unrecognised GSTIN state code. Fix the customer's address or GSTIN in the " +
+        "admin panel, then it retries automatically — this blocks on purpose rather than " +
+        "guessing, since a wrong guess misfiles tax in the client's books."
+    );
+  }
+
+  const isIntraState = normalizeState(resolvedState) === normalizeState(names.homeState);
+
+  if (isIntraState) {
+    const cgst = roundMoney(taxTotal / 2);
+    const sgst = roundMoney(taxTotal - cgst);
+    return { cgst, sgst, igst: 0 };
+  }
+
+  return { cgst: 0, sgst: 0, igst: roundMoney(taxTotal) };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -87,7 +166,7 @@ interface InventoryLineInput {
   quantity: number;
   rate?: number;
   taxableValue: number;
-  unit?: string;
+  unit?: string | null;
 }
 
 function toInventory(
@@ -100,7 +179,7 @@ function toInventory(
     quantity: l.quantity,
     rate: l.rate,
     amount: l.taxableValue,
-    unit: l.unit,
+    unit: l.unit ?? undefined,
     godown: names.godown,
     accountingLedger,
   }));
@@ -146,7 +225,14 @@ export function buildSalesOrderXml(
     ledgerEntries.push({ ledger: names.discountLedger, amount: -p.discountAmount });
   }
 
-  ledgerEntries.push(...taxLedgerEntries(p.taxTotal, { gstin: p.buyer.gstin, state: null }, names, 1));
+  ledgerEntries.push(
+    ...taxLedgerEntries(
+      p.taxTotal,
+      { gstin: p.buyer.gstin ?? null, state: p.buyer.state ?? null },
+      names,
+      1
+    )
+  );
 
   // Fails loudly rather than posting a voucher Tally would half-accept. If this throws, the
   // app's subtotal/discount/tax/grandTotal do not reconcile — investigate there, not here.
@@ -208,10 +294,17 @@ export function buildCreditNoteXml(
 
   // Mirror image of the sale: we now owe the customer.
   const ledgerEntries: LedgerEntry[] = [
-    { ledger: p.buyerLedgerName ?? "", amount: p.totalCreditAmount, isPartyLedger: true },
+    { ledger: p.buyerLedgerName, amount: p.totalCreditAmount, isPartyLedger: true },
     { ledger: names.salesLedger, amount: -taxableTotal },
   ];
-  ledgerEntries.push(...taxLedgerEntries(taxTotal, { gstin: p.buyerGstin ?? null, state: null }, names, -1));
+  ledgerEntries.push(
+    ...taxLedgerEntries(
+      taxTotal,
+      { gstin: p.buyerGstin ?? null, state: p.buyerState ?? null },
+      names,
+      -1
+    )
+  );
   assertBalanced(ledgerEntries);
 
   const body = renderVoucher({
@@ -324,32 +417,50 @@ export function buildCancelSalesOrderXml(
 /*  Dispatch                                                                  */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Build the import XML for an already-validated request (`pushRequestSchema.parse`). Taking the
+ * parsed union rather than `unknown` means no casts: each case sees exactly its own payload type.
+ */
 export function buildVoucherXml(
-  type: TallyJobType,
-  payload: unknown,
+  req: PushRequest,
   names: TallyNames,
   company?: string,
   postAsOptional = false
 ): string {
-  switch (type) {
+  switch (req.type) {
     case "push_sales_order":
-      return buildSalesOrderXml(payload as SalesOrderPayload, names, company, postAsOptional);
+      return buildSalesOrderXml(req, names, company, postAsOptional);
     case "push_delivery_note":
-      return buildDeliveryNoteXml(payload as DeliveryNotePayload, names, company, postAsOptional);
+      return buildDeliveryNoteXml(req, names, company, postAsOptional);
     case "push_credit_note":
-      return buildCreditNoteXml(payload as CreditNotePayload, names, company, postAsOptional);
+      return buildCreditNoteXml(req, names, company, postAsOptional);
     case "push_new_ledger":
       // A master creation, not a voucher — "Optional" has no meaning here.
-      return buildNewLedgerXml(payload as NewLedgerPayload, names, company);
+      return buildNewLedgerXml(req, names, company);
     case "push_stock_journal":
-      return buildStockJournalXml(payload as StockJournalPayload, names, company, postAsOptional);
+      return buildStockJournalXml(req, names, company, postAsOptional);
     case "push_cancel_sales_order":
       // Cancels a voucher already pushed (by voucher number). UNVERIFIED whether Tally's Cancel
       // action applies cleanly to an Optional voucher the accountant hasn't converted yet — see
       // the README's validation checklist. Left as a real Cancel either way, not made Optional
       // itself: cancelling is inherently the "undo" action, there is no draft form of it.
-      return buildCancelSalesOrderXml(payload as CancelSalesOrderPayload, names, company);
-    default:
-      throw new Error(`Unknown Tally job type: ${type}`);
+      return buildCancelSalesOrderXml(req, names, company);
+  }
+}
+
+/** The date a voucher is posted on — used to scope the REMOTEID lookup to one day. */
+export function voucherDate(req: PushRequest): string | null {
+  switch (req.type) {
+    case "push_sales_order":
+      return req.orderDate;
+    case "push_delivery_note":
+      return req.dispatchDate;
+    case "push_credit_note":
+      return req.returnDate;
+    case "push_stock_journal":
+      return req.date;
+    case "push_new_ledger":
+    case "push_cancel_sales_order":
+      return null;
   }
 }

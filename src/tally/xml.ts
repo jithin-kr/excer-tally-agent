@@ -243,6 +243,23 @@ export function parseTallyXml(xml: string): any {
   return parser.parse(xml);
 }
 
+// EXCER ADDITION: the parser above turns "0012" into 12, which is wrong for identifiers — a
+// voucher numbered "0012" must be cancelled as "0012". Use this one when reading ids and numbers
+// that are really strings.
+const stringParser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: "@_",
+  allowBooleanAttributes: true,
+  parseAttributeValue: false,
+  parseTagValue: false,
+  trimValues: true,
+  removeNSPrefix: true,
+});
+
+export function parseTallyXmlAsStrings(xml: string): any {
+  return stringParser.parse(xml);
+}
+
 export interface ImportResult {
   created: number;
   altered: number;

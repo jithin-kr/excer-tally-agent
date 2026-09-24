@@ -5,23 +5,26 @@ import { TallyClient } from "./tally/client.js";
 import { createAgentServer } from "./server.js";
 import { createPollState, startPollLoop } from "./poll-loop.js";
 import { AGENT_VERSION, startHeartbeat } from "./heartbeat.js";
+import { loadWatermarks } from "./state-store.js";
+import { errorMessage, log } from "./log.js";
 
 async function main() {
   const config = loadAgentConfig();
   const client = new TallyClient();
-  const state = createPollState();
+  const state = createPollState(loadWatermarks(config.stateFile, client.config.defaultCompany ?? null));
 
-  const server = createAgentServer(config, client);
+  const server = createAgentServer(config, client, state);
   const stopPoll = startPollLoop(config, client, state);
   const stopHeartbeat = startHeartbeat(config, client, state);
 
   server.listen(config.port, "127.0.0.1", () => {
-    console.log(`excer-tally-agent v${AGENT_VERSION}`);
-    console.log(`  listening      http://127.0.0.1:${config.port}`);
-    console.log(`  tally          ${client.config.url}`);
-    console.log(`  company        ${client.config.defaultCompany ?? "(active company)"}`);
-    console.log(`  poll every     ${config.pollIntervalMs}ms`);
-    console.log(`  reporting to   ${config.appBaseUrl ?? "(no app URL configured)"}`);
+    log.info("agent", `excer-tally-agent v${AGENT_VERSION}`);
+    log.info("agent", `  listening      http://127.0.0.1:${config.port}`);
+    log.info("agent", `  tally          ${client.config.url}`);
+    log.info("agent", `  company        ${client.config.defaultCompany ?? "(active company)"}`);
+    log.info("agent", `  poll every     ${config.pollIntervalMs}ms`);
+    log.info("agent", `  watermarks     masters=${state.lastMasterAlterId} vouchers=${state.lastVoucherAlterId} (${config.stateFile})`);
+    log.info("agent", `  reporting to   ${config.appBaseUrl ?? "(no app URL configured)"}`);
   });
 
   // Bound to 127.0.0.1 on purpose: the only route in is the Cloudflare Tunnel, which connects
@@ -29,7 +32,7 @@ async function main() {
   // can write to the accounting books.
 
   const shutdown = () => {
-    console.log("shutting down…");
+    log.info("agent", "shutting down…");
     stopPoll();
     stopHeartbeat();
     server.close(() => process.exit(0));
@@ -40,6 +43,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("Failed to start:", err instanceof Error ? err.message : err);
+  log.error("agent", `Failed to start: ${errorMessage(err)}`);
   process.exit(1);
 });
