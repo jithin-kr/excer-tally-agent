@@ -23,7 +23,7 @@ changes back, through a Cloudflare Tunnel so nothing is exposed. See [prd.md](pr
 |---|---|
 | Agent repo | GitHub `jithin-kr/excer-tally-agent`, branch **`main` only** (CI on every push) |
 | Website repo | `excer-global`, sibling folder; GitHub `sarath-velvetek/Excer-Global` |
-| Handover PDF | `Excer-Tally-Agent.pdf` (untracked, dated 2026-09-16, out of date) |
+| Handover PDF | `docs/Excer-Tally-Agent.pdf` (client-facing, dated 2026-09-16; predates the live-Tally verification — README is current) |
 | Detailed record | `README.md` ("Verified against a live TallyPrime"); website `CLAUDE.md` §20–§22, §39 |
 | Upstream licence notice | `NOTICE` — required by MIT for the five `src/tally/*` files |
 
