@@ -51,7 +51,7 @@ export function stockItem(guid: string, alterId: number, qty: number): string {
  * A stand-in TallyClient. `respond` sees each request's XML and returns Tally's answer; every
  * request is recorded so tests can assert on what was (and was not) asked.
  */
-export function fakeClient(respond: (xml: string) => string, company = "Test Co") {
+export function fakeClient(respond: (xml: string) => string | Promise<string>, company = "Test Co") {
   const requests: string[] = [];
   const client = {
     config: { url: "http://fake-tally:9000", defaultCompany: company, host: "fake", port: 9000, timeoutMs: 1000 },

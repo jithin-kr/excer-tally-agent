@@ -21,7 +21,7 @@ import type {
 } from "./contract.js";
 import { escapeXml } from "../tally/xml.js";
 import {
-  assertBalanced,
+  assertVoucherBalanced,
   masterImportEnvelope,
   renderCancelVoucher,
   renderVoucher,
@@ -107,6 +107,33 @@ function stateFromGstin(gstin: string): string | null {
 /** Same rounding convention as the main app's `roundMoney` (`features/orders/approval.ts`). */
 function roundMoney(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+/**
+ * The discount to post as its own ledger line, worked out from the totals.
+ *
+ * The payload does not say whether line `taxableValue`s are before or after the order discount,
+ * and the two readings need different vouchers: pre-discount lines need a separate Discount
+ * Allowed debit; post-discount lines must NOT get one, or the discount counts twice. The totals
+ * settle it — `lines + tax - grandTotal` is the discount the lines still carry:
+ *   = discountAmount  -> lines are pre-discount, post the discount line
+ *   = 0               -> lines already net of discount, post none
+ *   anything else     -> the payload does not add up; refuse rather than guess.
+ */
+export function invoiceDiscount(
+  lineTotal: number,
+  taxTotal: number,
+  grandTotal: number,
+  discountAmount: number
+): number {
+  const implied = roundMoney(lineTotal + taxTotal - grandTotal);
+  if (Math.abs(implied - discountAmount) <= 0.01) return roundMoney(discountAmount);
+  if (Math.abs(implied) <= 0.01) return 0;
+  throw new Error(
+    `Order totals do not reconcile: line values ${lineTotal.toFixed(2)} + tax ${taxTotal.toFixed(2)} ` +
+      `- grand total ${grandTotal.toFixed(2)} = ${implied.toFixed(2)}, which matches neither the ` +
+      `discount (${discountAmount.toFixed(2)}) nor zero.`
+  );
 }
 
 /**
@@ -213,16 +240,21 @@ export function buildSalesOrderXml(
   company?: string,
   postAsOptional = false
 ): string {
+  // Goods go OUT -> each line is a Credit, and carries the sales ledger in its ACCOUNTINGALLOCATIONS.
+  // That allocation IS the sales posting: invoice-mode vouchers must not ALSO list the sales ledger
+  // as a ledger line, or sales count twice and Tally rejects the voucher (verified live).
+  const inventoryEntries = toInventory(p.lineItems, names, names.salesLedger);
+  const lineTotal = roundMoney(inventoryEntries.reduce((sum, i) => sum + i.amount, 0));
+  const discount = invoiceDiscount(lineTotal, p.taxTotal, p.grandTotal, p.discountAmount);
+
   const ledgerEntries: LedgerEntry[] = [
     // Party owes us the full invoice value -> Debit.
     { ledger: p.buyer.ledgerName, amount: -p.grandTotal, isPartyLedger: true },
-    // Sales income -> Credit, at gross (pre-discount) value.
-    { ledger: names.salesLedger, amount: p.subtotal },
   ];
 
-  if (p.discountAmount > 0) {
+  if (discount > 0) {
     // Discount allowed is an expense -> Debit.
-    ledgerEntries.push({ ledger: names.discountLedger, amount: -p.discountAmount });
+    ledgerEntries.push({ ledger: names.discountLedger, amount: -discount });
   }
 
   ledgerEntries.push(
@@ -234,9 +266,9 @@ export function buildSalesOrderXml(
     )
   );
 
-  // Fails loudly rather than posting a voucher Tally would half-accept. If this throws, the
-  // app's subtotal/discount/tax/grandTotal do not reconcile — investigate there, not here.
-  assertBalanced(ledgerEntries);
+  // Fails loudly rather than posting a voucher Tally would reject. If this throws, the app's
+  // line values/discount/tax/grandTotal do not reconcile — investigate there, not here.
+  assertVoucherBalanced(ledgerEntries, inventoryEntries);
 
   const body = renderVoucher({
     voucherType: names.salesOrderVoucherType,
@@ -247,7 +279,7 @@ export function buildSalesOrderXml(
     isInvoice: true,
     view: "Invoice Voucher View",
     ledgerEntries,
-    inventoryEntries: toInventory(p.lineItems, names, names.salesLedger),
+    inventoryEntries,
     isOptional: postAsOptional,
   });
   return voucherImportEnvelope(body, company);
@@ -263,17 +295,34 @@ export function buildDeliveryNoteXml(
   company?: string,
   postAsOptional = false
 ): string {
-  // A Delivery Note moves goods, not money: inventory lines only, no ledger postings.
+  // A Delivery Note moves goods, not money — Delivery Note is a non-accounting voucher type, so
+  // these values never reach the books. But Tally still wants the invoice layout: party line +
+  // item lines carrying the sales allocation. Verified live: an inventory-only Delivery Note is
+  // rejected (EXCEPTIONS 1, no message); the invoice layout is created.
+  if (!p.buyerLedgerName) {
+    throw new Error(
+      "Cannot post a Delivery Note without buyerLedgerName — Tally needs the party. The main app " +
+        "sends it from the order's customer ledger; check buildDeliveryNotePayload()."
+    );
+  }
+  const inventoryEntries = toInventory(p.lineItems, names, names.salesLedger); // goods out -> Credit
+  const lineTotal = roundMoney(inventoryEntries.reduce((sum, i) => sum + i.amount, 0));
+  const ledgerEntries: LedgerEntry[] = [
+    { ledger: p.buyerLedgerName, amount: -lineTotal, isPartyLedger: true },
+  ];
+  assertVoucherBalanced(ledgerEntries, inventoryEntries);
+
   const body = renderVoucher({
     voucherType: names.deliveryNoteVoucherType,
     date: p.dispatchDate,
     remoteId: p.remoteId,
-    partyLedger: p.buyerLedgerName ?? undefined,
+    partyLedger: p.buyerLedgerName,
     reference: p.referencedVoucherNumber ?? undefined,
     narration: [p.courierName, p.trackingNumber].filter(Boolean).join(" ") || undefined,
-    view: "Inventory Voucher View",
-    ledgerEntries: [],
-    inventoryEntries: toInventory(p.lineItems, names),
+    isInvoice: true,
+    view: "Invoice Voucher View",
+    ledgerEntries,
+    inventoryEntries,
     isOptional: postAsOptional,
   });
   return voucherImportEnvelope(body, company);
@@ -292,10 +341,15 @@ export function buildCreditNoteXml(
   const taxableTotal = p.lineItems.reduce((sum, l) => sum + l.taxableValue, 0);
   const taxTotal = Number((p.totalCreditAmount - taxableTotal).toFixed(2));
 
-  // Mirror image of the sale: we now owe the customer.
+  // Mirror image of the sale: goods come back IN -> each line is a Debit (negative), carrying the
+  // sales ledger in its allocation; we now owe the customer -> party is a Credit. Posting the
+  // returned goods as a Credit (upstream's sign) left the voucher unbalanced and Tally rejected it.
+  const inventoryEntries = toInventory(p.lineItems, names, names.salesLedger).map((i) => ({
+    ...i,
+    amount: -i.amount,
+  }));
   const ledgerEntries: LedgerEntry[] = [
     { ledger: p.buyerLedgerName, amount: p.totalCreditAmount, isPartyLedger: true },
-    { ledger: names.salesLedger, amount: -taxableTotal },
   ];
   ledgerEntries.push(
     ...taxLedgerEntries(
@@ -305,7 +359,7 @@ export function buildCreditNoteXml(
       -1
     )
   );
-  assertBalanced(ledgerEntries);
+  assertVoucherBalanced(ledgerEntries, inventoryEntries);
 
   const body = renderVoucher({
     voucherType: names.creditNoteVoucherType,
@@ -317,7 +371,7 @@ export function buildCreditNoteXml(
     isInvoice: true,
     view: "Invoice Voucher View",
     ledgerEntries,
-    inventoryEntries: toInventory(p.lineItems, names, names.salesLedger),
+    inventoryEntries,
     isOptional: postAsOptional,
   });
   return voucherImportEnvelope(body, company);
@@ -327,6 +381,9 @@ export function buildCreditNoteXml(
 /*  4. New Customer Ledger (a master, not a voucher)                          */
 /* -------------------------------------------------------------------------- */
 
+/** GST came into force in India on 1 July 2017 — the earliest date any GST detail can apply from. */
+const GST_EFFECTIVE_FROM = "20170701";
+
 export function buildNewLedgerXml(p: NewLedgerPayload, names: TallyNames, company?: string): string {
   const addressLines = (p.address ?? "")
     .split("\n")
@@ -335,6 +392,27 @@ export function buildNewLedgerXml(p: NewLedgerPayload, names: TallyNames, compan
     .map((l) => `<ADDRESS>${escapeXml(l)}</ADDRESS>`)
     .join("");
 
+  // TallyPrime 3+ stores address/state and GST registration in DATED lists and silently ignores
+  // the old flat tags (verified live 2026-09-24: a ledger created with only <LEDSTATENAME> had no
+  // state at all). Both forms are written, so older builds still get the flat ones.
+  // APPLICABLEFROM is GST's start date (1 Jul 2017): the details must already be in force on the
+  // date of any voucher posted against this customer, and no voucher predates GST.
+  const mailing = `
+        <LEDMAILINGDETAILS.LIST>
+          <APPLICABLEFROM>${GST_EFFECTIVE_FROM}</APPLICABLEFROM>
+          <MAILINGNAME>${escapeXml(p.customerName)}</MAILINGNAME>
+          ${addressLines ? `<ADDRESS.LIST TYPE="String">${addressLines}</ADDRESS.LIST>` : ""}
+          ${p.state ? `<STATE>${escapeXml(p.state)}</STATE>` : ""}
+          <COUNTRY>India</COUNTRY>
+        </LEDMAILINGDETAILS.LIST>`;
+  const gstReg = `
+        <LEDGSTREGDETAILS.LIST>
+          <APPLICABLEFROM>${GST_EFFECTIVE_FROM}</APPLICABLEFROM>
+          <GSTREGISTRATIONTYPE>${p.gstin ? "Regular" : "Unregistered/Consumer"}</GSTREGISTRATIONTYPE>
+          ${p.state ? `<PLACEOFSUPPLY>${escapeXml(p.state)}</PLACEOFSUPPLY>` : ""}
+          ${p.gstin ? `<GSTIN>${escapeXml(p.gstin)}</GSTIN>` : ""}
+        </LEDGSTREGDETAILS.LIST>`;
+
   const body = `
     <TALLYMESSAGE xmlns:UDF="TallyUDF">
       <LEDGER NAME="${escapeXml(p.customerName)}" ACTION="Create">
@@ -342,6 +420,8 @@ export function buildNewLedgerXml(p: NewLedgerPayload, names: TallyNames, compan
         <NAME>${escapeXml(p.customerName)}</NAME>
         <PARENT>${escapeXml(names.customerParentGroup)}</PARENT>
         <ISBILLWISEON>Yes</ISBILLWISEON>
+        ${mailing}
+        ${gstReg}
         ${p.gstin ? `<PARTYGSTIN>${escapeXml(p.gstin)}</PARTYGSTIN>` : ""}
         ${p.gstin ? "<GSTREGISTRATIONTYPE>Regular</GSTREGISTRATIONTYPE>" : ""}
         ${p.state ? `<LEDSTATENAME>${escapeXml(p.state)}</LEDSTATENAME>` : ""}
@@ -363,26 +443,29 @@ export function buildStockJournalXml(
   company?: string,
   postAsOptional = false
 ): string {
-  // UNVERIFIED: Tally's Stock Journal uses DESTINATIONLIST/SOURCELIST in some configurations
-  // rather than a flat ALLINVENTORYENTRIES.LIST. This renders the flat form. Confirm against
-  // their Tally before trusting cable-cut postings — see the README's validation checklist.
+  // Records the cut as a matched OUT + IN of the same length, so the item's stock total is
+  // unchanged. Deliberately net-zero: the cut metres leave stock through the order's own sale /
+  // Delivery Note, and a stock journal that ALSO consumed them would deduct the same goods twice.
+  // If the business wants cuts to consume stock (e.g. offcut wastage), that is a decision to make
+  // explicitly — see the README. Verified live: Tally needs INVENTORYENTRIESOUT/IN.LIST here (the
+  // flat list is rejected), and accepts zero-value lines, so no cost rate is needed.
+  const line = (direction: "out" | "in"): InventoryEntry => ({
+    stockItem: p.itemName,
+    quantity: p.cutLength,
+    amount: 0,
+    unit: p.unit ?? undefined,
+    godown: names.godown,
+    direction,
+    isDeemedPositive: direction === "in",
+  });
   const body = renderVoucher({
     voucherType: names.stockJournalVoucherType,
     date: p.date,
     remoteId: p.remoteId,
-    narration: `Cut ${p.cutLength} ${p.unit} from roll ${p.rollBarcode} (${p.remainingLength} ${p.unit} remaining)`,
-    view: "Inventory Voucher View",
+    narration: `Cut ${p.cutLength}${p.unit ? ` ${p.unit}` : ""} from roll ${p.rollBarcode} (${p.remainingLength}${p.unit ? ` ${p.unit}` : ""} remaining)`,
+    view: "Consumption Voucher View",
     ledgerEntries: [],
-    inventoryEntries: [
-      {
-        stockItem: p.itemName,
-        quantity: p.cutLength,
-        amount: 0,
-        unit: p.unit,
-        godown: names.godown,
-        isDeemedPositive: true,
-      },
-    ],
+    inventoryEntries: [line("out"), line("in")],
     isOptional: postAsOptional,
   });
   return voucherImportEnvelope(body, company);
@@ -397,17 +480,11 @@ export function buildCancelSalesOrderXml(
   names: TallyNames,
   company?: string
 ): string {
-  if (!p.salesOrderVoucherNumber) {
-    throw new Error(
-      "Cannot cancel: salesOrderVoucherNumber is missing. Tally cancels a voucher by its " +
-        "voucher number, not by REMOTEID. The main app must include Order.tallyVoucherNumber " +
-        "in buildCancelVoucherPayload() — see the README."
-    );
-  }
+  // The Sales Order is identified by the REMOTEID it was pushed with — the app always sends it as
+  // referencedSalesOrderRemoteId. Verified live: cancel-by-REMOTEID needs no date or number.
   const body = renderCancelVoucher({
     voucherType: names.salesOrderVoucherType,
-    date: p.cancellationDate,
-    voucherNumber: p.salesOrderVoucherNumber,
+    remoteId: p.referencedSalesOrderRemoteId,
     narration: p.reason ?? undefined,
   });
   return voucherImportEnvelope(body, company);

@@ -26,7 +26,13 @@ Also get, from their Tally person:
 - The **voucher type names** they actually use ("Sales Order"? "Delivery Challan"? custom?)
 - Their **ledger names** for sales, CGST, SGST, IGST, discount
 - Whether **godowns** are enabled, and which one the web shop sells from
-- Their **customer group** name (usually "Sundry Debtors", but not always)
+- Their **customer group** name (usually "Sundry Debtors", but not always; sub-groups under it are
+  included automatically)
+- Whether **GST rate and HSN are set on each stock item**, or only on stock groups. The agent
+  reads them from the item; an item without its own rate syncs with an unknown rate, and orders
+  containing it wait (by design, rather than going out tax-free)
+- Whether each item has a **standard selling price** set. That, plus GST, becomes the website's
+  base price; items without one keep their website price
 
 These go into `.env`. The defaults in `.env.example` are Tally's out-of-the-box names and are
 very likely wrong for this installation.
@@ -44,7 +50,15 @@ F1 (Help) → Settings → Connectivity → Client/Server configuration
     Port                :  9000
 ```
 
-Then **restart Tally** and open the test company.
+Then **restart Tally** and open the test company. (If `tally.ini` in Tally's install folder still
+says `Client Server=None`, the setting did not take.)
+
+In the company, press **F11 (Features)** and make sure **Enable Order Processing** is on, and
+Delivery Notes / tracking numbers if offered. Without it the *Sales Order* and *Delivery Note*
+voucher types are inactive and every such push is rejected.
+
+> Testing on an **Educational (unlicensed)** Tally? It only accepts voucher dates on the **1st,
+> 2nd and 31st** of a month. Date test orders accordingly.
 
 Verify from a browser on that same machine: `http://localhost:9000` should return XML, not a
 connection error.
@@ -58,7 +72,7 @@ connection error.
 ## Step 2 — Install Node.js
 
 Download the current **LTS** from <https://nodejs.org> and install with defaults.
-Node 20 or newer is required (the agent uses `--env-file-if-exists`).
+Node 22.9 or newer is required (the agent uses `--env-file-if-exists`); the installer checks this.
 
 Confirm in a new PowerShell window:
 
@@ -95,12 +109,13 @@ notepad .env
 Fill in, at minimum:
 
 - `TALLY_COMPANY` — the exact company name
-- `AGENT_API_KEY` — a long random secret. Generate one:
+- `AGENT_API_KEY` — a long random secret, at least 16 characters (the agent refuses to start with
+  a shorter one or with `change-me`). Generate one:
   ```powershell
   -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 48 | ForEach-Object {[char]$_})
   ```
 - `EXCER_APP_URL` — your production app URL
-- `EXCER_APP_TOKEN` — a second long random secret
+- `EXCER_APP_TOKEN` — a second long random secret; the website's `TALLY_AGENT_TOKEN` must match it
 - Every `TALLY_VT_*`, `TALLY_LEDGER_*`, `TALLY_GROUP_*` value from their Tally person
 
 The same `AGENT_API_KEY` goes into the Vercel environment as `TALLY_CONNECTOR_API_KEY`.
@@ -118,15 +133,18 @@ npm run doctor
 ```
 
 `doctor` makes no writes. It reports whether Tally is reachable, whether the AlterID counters
-work, and whether stock items and customer ledgers come back with the fields we need.
+work, whether stock items and customer ledgers come back with the fields we need, and whether the
+lookups the agent uses to detect duplicates are accepted. It exits 0 only when the agent can work.
 
-Read its warnings carefully. In particular:
+Read its output carefully. In particular:
 
-- **"AlterID counters both returned 0"** — incremental sync will not work. The field names differ
-  on this Tally build. Do not proceed as if this is fine; the poll loop would run forever finding
-  "nothing changed" and silently sync nothing.
-- **"GUID empty"** — record linking will not work.
+- **FAIL "AlterID counters both returned 0"** — incremental sync cannot work, and the poll loop
+  refuses to run (rather than exporting everything every 15 seconds). The company is empty or the
+  field names differ on this Tally build.
+- **WARN "GUID empty"** — record linking will not work.
 - **"no ledgers under Sundry Debtors"** — wrong group name; ask them what theirs is called.
+- **NOTE "hsnCode empty" / "no standard selling price"** — set on the stock group or not set; see
+  "Before you travel".
 
 Fix these before going further. This is the whole reason `doctor` exists.
 
@@ -158,7 +176,12 @@ Verify:
 curl http://127.0.0.1:7010/health
 ```
 
-You want `"tallyReachable": true`.
+You want `"tallyReachable": true`. Without a key `/health` shows only that; for the last error,
+company, and sync position, send the key:
+
+```powershell
+curl -H "x-api-key: <AGENT_API_KEY>" http://127.0.0.1:7010/health
+```
 
 ---
 
@@ -174,8 +197,14 @@ anything on their firewall.
 1. In Vercel, set `TALLY_CONNECTOR_BASE_URL` to the tunnel hostname and
    `TALLY_CONNECTOR_API_KEY` to the `AGENT_API_KEY` from Step 4. Redeploy.
 2. Open `/admin/tally-sync` and press **Pull from Tally**. Check the Sync History row.
-3. Confirm a test order, then press **Push to Tally**.
-4. Open Tally and look for the voucher. Check the **test company**, not the live one.
+3. Confirm a test order. It is pushed automatically within seconds (**Push to Tally** forces it).
+4. Open Tally and look for the voucher in the **Optional** vouchers of the **test company**, not
+   the live one. The agent's log line for it should show a `guid=`.
+5. Push the same thing again (e.g. the button): the log must say `duplicate`, and Tally must
+   still hold one voucher.
+
+> Known issue (2026-09-24): Tally rejects the agent's **Sales Order** with `Bad Order Number in
+> Voucher!`. Delivery Notes, Credit Notes, cable cuts, customers and cancels work. See the README.
 
 ---
 
@@ -198,7 +227,12 @@ The install script stops the service, rebuilds, and restarts it. `.env` is never
 | `health` says Tally unreachable | Tally closed, company not open, or gateway setting reverted after a Tally update |
 | Service starts then stops immediately | Almost always `.env` — a missing `AGENT_API_KEY` throws at startup. Check `logs\agent.err.log` |
 | Pull returns zero rows | `sinceAlterId` watermark is ahead of reality, or the customer group name is wrong |
-| Push returns 422 | Tally rejected the voucher. The response includes Tally's own `lineError` — usually a ledger or voucher type name that doesn't exist |
+| Push returns 422 with Tally's message | Tally rejected the voucher — usually a ledger, voucher type or stock item name that doesn't exist in this company |
+| 422 "Tally wrote nothing and gave no reason" | Tally rejected it silently — typically an unknown unit, an inactive voucher type (F11), or a layout issue. Check the voucher type is active |
+| 422 "Bad Order Number in Voucher!" | Known Sales Order issue, see the README |
+| Push returns 400 | The website sent a malformed payload (a bug there). The response lists each bad field; it is not retried |
+| Push returns 409 | A different Tally ledger already has this customer's name. Rename one of them; it is not retried |
+| Website job says "GST rate unknown" | Set the GST rate on that stock item in Tally; it syncs and the job retries by itself |
 | Everything works, then stops at 6pm | They close Tally at end of day. Queued jobs will go out next morning; this is expected |
 
 Logs (NSSM backend): `C:\excer-tally-agent\logs\agent.out.log` and `agent.err.log`, rotated at
@@ -210,7 +244,9 @@ Logs (NSSM backend): `C:\excer-tally-agent\logs\agent.out.log` and `agent.err.lo
 
 - **The Tally machine must be on, with Tally open**, for sync to happen. Orders placed while it's
   off are queued and go out when it comes back — nothing is lost, but nothing is instant either.
-- **Stock in the website is up to ~15 seconds behind Tally.** Orders going *into* Tally are near
-  instant.
+- **Stock in the website is up to about a minute behind Tally** (customer and item changes about
+  15 seconds). Orders going *into* Tally are near instant.
+- **Orders arrive in Tally as Optional vouchers.** They affect no balance or stock until an
+  accountant converts them to Regular — that is the review step.
 - **Someone needs to tell us if that machine is replaced or rebuilt.** The agent has to be
   reinstalled.

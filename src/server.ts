@@ -16,7 +16,12 @@ import { buildVoucherXml, voucherDate } from "./excer/vouchers.js";
 import { fetchLedgers, fetchStockItems } from "./excer/masters.js";
 import { findLedgerByName, findVoucherByRemoteId, type VoucherIdentity } from "./excer/lookup.js";
 import { parseImportResult } from "./tally/xml.js";
-import { pushRequestSchema, type PushRequest, type PushResponse } from "./excer/contract.js";
+import {
+  pushRequestSchema,
+  type MastersResponse,
+  type PushRequest,
+  type PushResponse,
+} from "./excer/contract.js";
 import type { PollState } from "./poll-loop.js";
 import { AGENT_VERSION } from "./heartbeat.js";
 import { errorMessage, log } from "./log.js";
@@ -92,7 +97,7 @@ export function createAgentServer(config: AgentConfig, client: TallyClient, poll
   async function readBack(req: PushRequest): Promise<VoucherIdentity | null> {
     if (req.type === "push_new_ledger") {
       const ledger = await findLedgerByName(client, req.customerName, company);
-      return ledger ? { guid: ledger.guid, voucherNumber: null } : null;
+      return ledger ? { guid: ledger.guid, voucherNumber: null, cancelled: false } : null;
     }
     const date = voucherDate(req);
     if (!date) return null;
@@ -100,6 +105,26 @@ export function createAgentServer(config: AgentConfig, client: TallyClient, poll
   }
 
   async function handlePush(req: PushRequest): Promise<{ status: number; body: PushResponse }> {
+    // A cancel targets the Sales Order by its REMOTEID. Check it first: a clear "not in Tally" beats
+    // Tally's own answer for a missing REMOTEID ("The date 0-0-0 is Out of Range!"), and an order
+    // that is already cancelled makes a retried cancel a duplicate, not a second write.
+    if (req.type === "push_cancel_sales_order") {
+      const order = await findVoucherByRemoteId(client, req.referencedSalesOrderRemoteId, null, company);
+      if (!order) {
+        throw new HttpError(
+          422,
+          `No Sales Order with REMOTEID "${req.referencedSalesOrderRemoteId}" exists in Tally — ` +
+            `it was never posted, or was deleted there. Nothing to cancel.`
+        );
+      }
+      if (order.cancelled) {
+        return {
+          status: 200,
+          body: { success: true, duplicate: true, remoteId: req.remoteId, guid: order.guid },
+        };
+      }
+    }
+
     // ── 1. Already in Tally? Answer without writing. ──────────────────────
     // Checked BEFORE sending because re-importing a known REMOTEID may alter the existing
     // voucher instead of being ignored — e.g. flipping one the accountant already converted to
@@ -150,10 +175,18 @@ export function createAgentServer(config: AgentConfig, client: TallyClient, poll
       };
     }
 
-    if (result.errors > 0 || result.lineError) {
+    // Success means Tally says it WROTE something. Checking only for errors is not enough: live
+    // TallyPrime rejected a Sales Order with every count at 0 apart from EXCEPTIONS, and an
+    // "all zeros, no error" answer must never be reported to the app as posted.
+    const wrote = result.created + result.altered + result.combined + result.cancelled > 0;
+    if (result.errors > 0 || result.exceptions > 0 || result.lineError || !wrote) {
       return {
         status: 422,
-        body: { success: false, error: result.lineError ?? "Tally rejected the voucher", tallyResult: result },
+        body: {
+          success: false,
+          error: result.lineError ?? (wrote ? "Tally rejected the voucher" : "Tally wrote nothing and gave no reason"),
+          tallyResult: { ...result, raw: undefined },
+        },
       };
     }
 
@@ -188,8 +221,24 @@ export function createAgentServer(config: AgentConfig, client: TallyClient, poll
     };
   }
 
-  const server = createServer(async (req, res) => {
-    const url = new URL(req.url ?? "/", `http://localhost:${config.port}`);
+  // Pushes run one at a time, each to completion (check -> write -> read back). Without this, two
+  // requests for the same remoteId — the app retrying while its first attempt is still waiting on
+  // Tally — could both pass the "already in Tally?" check before either writes, and import twice.
+  // TallyClient's own queue serializes single requests, not this three-step sequence.
+  let pushQueue: Promise<unknown> = Promise.resolve();
+  function oneAtATime<T>(fn: () => Promise<T>): Promise<T> {
+    const run = pushQueue.then(fn);
+    pushQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let url: URL;
+    try {
+      url = new URL(req.url ?? "/", `http://localhost:${config.port}`);
+    } catch {
+      return json(res, 400, { error: "Malformed request URL" });
+    }
     const authorized = isAuthorized(req.headers["x-api-key"], config.apiKey);
 
     // Liveness probe. Unauthenticated so a tunnel health check can use it — which also means it is
@@ -229,7 +278,8 @@ export function createAgentServer(config: AgentConfig, client: TallyClient, poll
           ...ledgers.map((r) => r.alterId)
         );
         state.lastPullAt = new Date().toISOString();
-        return json(res, 200, { stockItems, ledgers, maxAlterId });
+        const body: MastersResponse = { stockItems, ledgers, maxAlterId };
+        return json(res, 200, body);
       } catch (err) {
         return json(res, 502, { error: errorMessage(err) });
       }
@@ -255,7 +305,7 @@ export function createAgentServer(config: AgentConfig, client: TallyClient, poll
       const pushReq = parsed.data;
 
       try {
-        const { status, body: out } = await handlePush(pushReq);
+        const { status, body: out } = await oneAtATime(() => handlePush(pushReq));
         // One line per write attempt: the audit trail for "did the agent post this?".
         log.info(
           "push",
@@ -274,6 +324,17 @@ export function createAgentServer(config: AgentConfig, client: TallyClient, poll
     }
 
     return json(res, 404, { error: "Not found" });
+  }
+
+  // The request handler is async, so anything it throws becomes a rejected promise — and an
+  // unhandled rejection terminates Node. One malformed request must never take the agent down,
+  // so every request ends here: logged, answered with a 500 if nothing was sent yet.
+  const server = createServer((req, res) => {
+    route(req, res).catch((err) => {
+      log.error("http", `${req.method} ${req.url}: unhandled ${errorMessage(err)}`);
+      if (!res.headersSent) json(res, 500, { error: "Internal error" });
+      else res.destroy();
+    });
   });
 
   return server;

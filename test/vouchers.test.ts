@@ -105,7 +105,9 @@ function build(body: unknown, optional = true): string {
 
 test("sales order XML: stamps REMOTEID, Optional, and the intra-state tax ledgers", () => {
   const xml = build(salesOrder());
-  assert.match(xml, /<REMOTEID>excer-so-1<\/REMOTEID>/);
+  // REMOTEID must be a <VOUCHER> ATTRIBUTE — as an element, live Tally silently drops it.
+  assert.match(xml, /<VOUCHER REMOTEID="excer-so-1" /);
+  assert.doesNotMatch(xml, /<REMOTEID>/);
   assert.match(xml, /<ISOPTIONAL>Yes<\/ISOPTIONAL>/);
   assert.match(xml, /<LEDGERNAME>CGST<\/LEDGERNAME>/);
   assert.match(xml, /<LEDGERNAME>SGST<\/LEDGERNAME>/);
@@ -119,7 +121,7 @@ test("sales order XML: Optional flag can be turned off", () => {
 });
 
 test("sales order XML: totals that do not reconcile are refused", () => {
-  assert.throws(() => build(salesOrder({ grandTotal: 1200 })), /do not balance/);
+  assert.throws(() => build(salesOrder({ grandTotal: 1200 })), /do not reconcile/);
 });
 
 test("sales order XML: party and item names are XML-escaped", () => {
@@ -127,18 +129,61 @@ test("sales order XML: party and item names are XML-escaped", () => {
   assert.match(xml, /A &amp; B &lt;Traders&gt;/);
 });
 
-test("cancel XML: refuses without a voucher number", () => {
-  const cancel = {
+test("cancel XML: targets the Sales Order by its REMOTEID — no voucher number or date needed", () => {
+  const xml = build({
     type: "push_cancel_sales_order",
     remoteId: "excer-cancel-1",
     referencedSalesOrderRemoteId: "excer-so-1",
     cancellationDate: "2026-09-24",
-    reason: null,
-  };
-  assert.throws(() => build(cancel), /salesOrderVoucherNumber is missing/);
-  assert.match(build({ ...cancel, salesOrderVoucherNumber: "0012" }), /TAGVALUE="0012"/);
+    reason: "Customer changed mind",
+  });
+  assert.match(xml, /<VOUCHER REMOTEID="excer-so-1" VCHTYPE="Sales Order" ACTION="Cancel">/);
+  // Voucher numbers are not unique for Optional vouchers (verified live), so never cancel by one.
+  assert.doesNotMatch(xml, /TAGNAME|TAGVALUE/);
 });
 
 test("assertBalanced: a NaN amount is not 'balanced'", () => {
   assert.throws(() => assertBalanced([{ ledger: "X", amount: Number.NaN }]), /non-numeric/);
+});
+
+/* ── invoice layout, as verified against a live TallyPrime ───────────── */
+
+/** The ledger names posted in one list of the rendered XML, in order. */
+function ledgersIn(xml: string, list: string): string[] {
+  // Split on the opening tag rather than build a regex from `list`, which contains a ".".
+  return xml
+    .split(`<${list}>`)
+    .slice(1)
+    .map((chunk) => /<LEDGERNAME>([^<]+)<\/LEDGERNAME>/.exec(chunk)?.[1] ?? "");
+}
+
+test("invoice layout: LEDGERENTRIES.LIST, and sales ONLY via the item allocations (no double count)", () => {
+  const xml = build(salesOrder());
+  assert.doesNotMatch(xml, /ALLLEDGERENTRIES\.LIST/);
+  assert.deepEqual(ledgersIn(xml, "LEDGERENTRIES.LIST"), ["Acme Traders", "CGST", "SGST"]);
+  assert.deepEqual(ledgersIn(xml, "ACCOUNTINGALLOCATIONS.LIST"), ["Sales Accounts"]);
+});
+
+test("discount: pre-discount lines get a Discount line; post-discount lines do not", () => {
+  // Line 1000 (pre-discount), discount 100, taxable 900, tax 162, grand 1062.
+  const pre = build(salesOrder({ subtotal: 1000, discountAmount: 100, taxableValue: 900, taxTotal: 162, grandTotal: 1062 }));
+  assert.ok(ledgersIn(pre, "LEDGERENTRIES.LIST").includes("Discount Allowed"));
+  // Same order, but the app already netted the discount into the line (900).
+  const netLine = [{ itemName: "Cable 2.5mm", itemGuid: null, quantity: 10, unit: "Mtr", rate: 90, taxableValue: 900, gstRate: 18 }];
+  const post = build(salesOrder({ lineItems: netLine, subtotal: 1000, discountAmount: 100, taxableValue: 900, taxTotal: 162, grandTotal: 1062 }));
+  assert.ok(!ledgersIn(post, "LEDGERENTRIES.LIST").includes("Discount Allowed"));
+});
+
+test("credit note: returned goods are a DEBIT (goods come back in), party is a credit", () => {
+  const xml = build({
+    type: "push_credit_note", remoteId: "excer-cn-1", referencedRemoteId: "excer-so-1", returnDate: "2026-04-02",
+    lineItems: [{ itemName: "Cable 2.5mm", itemGuid: null, quantity: 10, rate: 60, taxableValue: 600, gstRate: 18 }],
+    totalCreditAmount: 708, reason: null, buyerLedgerName: "Acme Traders", buyerState: "Kerala",
+  });
+  const inv = xml.slice(xml.indexOf("<ALLINVENTORYENTRIES.LIST>"));
+  assert.match(inv, /<ISDEEMEDPOSITIVE>Yes<\/ISDEEMEDPOSITIVE>/);
+  assert.match(inv, /<AMOUNT>-600\.00<\/AMOUNT>/);
+  // No unit sent -> bare quantity, so Tally uses the item's own unit (never a guessed "nos").
+  assert.match(inv, /<ACTUALQTY>10<\/ACTUALQTY>/);
+  assert.doesNotMatch(xml, / nos</i);
 });

@@ -9,6 +9,17 @@
 import { TallyClient } from "./tally/client.js";
 import { getLastAlterIds, fetchLedgers, fetchStockItems } from "./excer/masters.js";
 import { findLedgerByName, findVoucherByRemoteId } from "./excer/lookup.js";
+import { getGlobalDispatcher } from "undici";
+
+/**
+ * End the run with an exit code WITHOUT process.exit(): exiting while undici still holds
+ * keep-alive sockets to Tally trips a libuv assertion on Windows ("UV_HANDLE_CLOSING"), which
+ * replaced our exit code with 127 — and the installer decides what to do from that code.
+ */
+async function finish(code: number): Promise<void> {
+  process.exitCode = code;
+  await getGlobalDispatcher().close().catch(() => undefined);
+}
 
 function ok(label: string, detail = "") {
   console.log(`  PASS  ${label}${detail ? ` — ${detail}` : ""}`);
@@ -44,7 +55,7 @@ async function main() {
   } catch (err) {
     fail("Tally reachable", err);
     console.log("\nStopping — nothing else can be checked until Tally answers.\n");
-    process.exit(1);
+    return finish(1);
   }
 
   // 2. Can we read stock items, and do the fields we need come back populated?
@@ -58,7 +69,9 @@ async function main() {
       console.log(`        sample: ${JSON.stringify(sample, null, 2).replace(/\n/g, "\n        ")}`);
       if (!sample.guid) console.log("  WARN  GUID empty — tallyGuid linking will not work.");
       if (!sample.alterId) console.log("  WARN  AlterID empty — incremental sync will not work.");
-      if (sample.baseRate === 0) console.log("  WARN  baseRate 0 — check the OpeningRate field name.");
+      if (sample.baseRate === null) {
+        console.log("  NOTE  no standard selling price on this item — its website base price won't sync.");
+      }
       if (!sample.hsnCode) console.log("  NOTE  hsnCode empty — may live on the stock GROUP here.");
     }
   } catch (err) {
@@ -106,10 +119,10 @@ async function main() {
 
   console.log("\nRead path checked. Writes are NOT tested here on purpose —");
   console.log("post your first voucher manually into a TEST company, never the live one.\n");
-  process.exit(reachable && countersOk ? 0 : 1);
+  await finish(reachable && countersOk ? 0 : 1);
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   console.error(err);
-  process.exit(1);
+  await finish(1);
 });

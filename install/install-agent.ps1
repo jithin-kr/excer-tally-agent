@@ -35,9 +35,11 @@ function Assert-Node {
         throw "Node.js is not installed or not on PATH. Install the current LTS from https://nodejs.org and reopen PowerShell."
     }
     $version = (& node --version).TrimStart("v")
-    $major = [int]($version.Split(".")[0])
-    if ($major -lt 20) {
-        throw "Node $version found, but this agent needs Node 20 or newer (it uses --env-file-if-exists)."
+    # Test the flag the service starts with, rather than trusting a version number: if this Node
+    # does not know --env-file-if-exists, the service would crash on every start.
+    & node --env-file-if-exists=.env-probe-does-not-exist -e "0" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Node $version does not support --env-file-if-exists. Install the current Node LTS (22.9 or newer) from https://nodejs.org."
     }
     Write-Host "  Node $version at $($node.Source)" -ForegroundColor DarkGray
 }
@@ -56,6 +58,12 @@ function Assert-EnvFile {
     $content = Get-Content $envPath -Raw
     if ($content -match "AGENT_API_KEY\s*=\s*change-me") {
         throw "AGENT_API_KEY is still 'change-me' in .env. Set a long random secret first."
+    }
+    if ($content -match "EXCER_APP_TOKEN\s*=\s*change-me") {
+        throw "EXCER_APP_TOKEN is still 'change-me' in .env. Set it to the app's TALLY_AGENT_TOKEN first."
+    }
+    if ($content -match "EXCER_APP_URL\s*=\s*https://excer\.example\.com") {
+        throw "EXCER_APP_URL is still the example value in .env. Set it to the real app URL first."
     }
     Write-Host "  .env present, API key set" -ForegroundColor DarkGray
 }

@@ -6,7 +6,10 @@ import { createPollState } from "../src/poll-loop.js";
 import { parseImportResult } from "../src/tally/xml.js";
 import { agentConfig, collection, collectionId, fakeClient } from "./helpers.js";
 
-const created = `<RESPONSE><CREATED>1</CREATED><LASTVCHID>987</LASTVCHID></RESPONSE>`;
+/** Wrap import counts the way real TallyPrime does: <ENVELOPE><BODY><DATA><IMPORTRESULT>. */
+const importResult = (inner: string) =>
+  `<ENVELOPE><HEADER><VERSION>1</VERSION><STATUS>1</STATUS></HEADER><BODY><DATA><IMPORTRESULT>${inner}</IMPORTRESULT></DATA></BODY></ENVELOPE>`;
+const created = importResult(`<CREATED>1</CREATED><LASTVCHID>987</LASTVCHID>`);
 const voucherRow = `<VOUCHER><GUID>guid-abc</GUID><VOUCHERNUMBER>0012</VOUCHERNUMBER></VOUCHER>`;
 
 const salesOrder = {
@@ -25,7 +28,7 @@ const salesOrder = {
 };
 
 /** Start the agent against a fake Tally; returns a fetch bound to it plus the recorded requests. */
-async function startAgent(respond: (xml: string) => string) {
+async function startAgent(respond: (xml: string) => string | Promise<string>) {
   const { client, requests } = fakeClient(respond);
   const poll = createPollState({ lastMasterAlterId: 5, lastVoucherAlterId: 7 });
   poll.tallyReachable = true;
@@ -39,7 +42,7 @@ async function startAgent(respond: (xml: string) => string) {
     return { status: res.status, body: (await res.json()) as any };
   };
   const push = (body: unknown) => call("/api/import/voucher", { method: "POST", body: JSON.stringify(body) });
-  return { call, push, requests, close: () => new Promise((r) => server.close(r)) };
+  return { address: server.address(), call, push, requests, close: () => new Promise((r) => server.close(r)) };
 }
 
 test("push: new voucher is written, then read back for its REAL voucher number", async () => {
@@ -147,11 +150,141 @@ test("isAuthorized: exact match only", () => {
   assert.equal(isAuthorized(undefined, "k"), false);
 });
 
+test("parseImportResult reads real TallyPrime's <IMPORTRESULT> counts", () => {
+  const r = parseImportResult(importResult("<CREATED>11</CREATED><ERRORS>2</ERRORS><IGNORED>1</IGNORED>"));
+  assert.deepEqual([r.created, r.errors, r.ignored], [11, 2, 1]);
+});
+
 test("looksLikeDuplicate: ignored-only is a duplicate; 'already exists' is not", () => {
-  assert.equal(looksLikeDuplicate(parseImportResult("<RESPONSE><IGNORED>1</IGNORED></RESPONSE>")), true);
+  assert.equal(looksLikeDuplicate(parseImportResult(importResult("<IGNORED>1</IGNORED>"))), true);
   assert.equal(
-    looksLikeDuplicate(parseImportResult("<RESPONSE><ERRORS>1</ERRORS></RESPONSE><LINEERROR>Ledger 'Acme' already exists</LINEERROR>")),
+    looksLikeDuplicate(parseImportResult(`<ENVELOPE><BODY><DATA><LINEERROR>Ledger 'Acme' already exists</LINEERROR><IMPORTRESULT><ERRORS>1</ERRORS></IMPORTRESULT></DATA></BODY></ENVELOPE>`)),
     false
   );
-  assert.equal(looksLikeDuplicate(parseImportResult("<RESPONSE><CREATED>1</CREATED></RESPONSE>")), false);
+  assert.equal(looksLikeDuplicate(parseImportResult(importResult("<CREATED>1</CREATED>"))), false);
+});
+
+test("a malformed request URL gets a 400 and the agent keeps running", async () => {
+  const { createConnection } = await import("node:net");
+  const agent = await startAgent(() => collection(""));
+  try {
+    const raw = await new Promise<string>((resolve, reject) => {
+      const address = agent.address as AddressInfo;
+      const sock = createConnection(address.port, "127.0.0.1", () => {
+        sock.write("GET http://[ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+      });
+      let out = "";
+      sock.on("data", (d) => (out += d));
+      sock.on("end", () => resolve(out));
+      sock.on("error", reject);
+    });
+    assert.match(raw, /^HTTP\/1\.1 400/);
+    assert.equal((await agent.call("/health", {}, null)).status, 200); // still alive
+  } finally {
+    await agent.close();
+  }
+});
+
+test("two simultaneous pushes of the same order import it ONCE", async () => {
+  let imports = 0;
+  // Tally takes a moment to answer, so the second push arrives while the first is mid-flight.
+  // Each answer reflects Tally's state when the request ARRIVES, then takes a moment to return —
+  // like real Tally, which answers queued requests in order.
+  const slow = <T>(v: T) => new Promise<T>((r) => setTimeout(() => r(v), 40));
+  const agent = await startAgent((xml) => {
+    if (collectionId(xml) === "Vouchers") {
+      imports += 1;
+      return slow(created);
+    }
+    return slow(collection(imports > 0 ? voucherRow : ""));
+  });
+  try {
+    const [a, b] = await Promise.all([agent.push(salesOrder), agent.push(salesOrder)]);
+    assert.equal(imports, 1);
+    assert.equal(a.body.success && b.body.success, true);
+    assert.equal([a.body.duplicate, b.body.duplicate].filter(Boolean).length, 1);
+  } finally {
+    await agent.close();
+  }
+});
+
+const cancelOrder = {
+  type: "push_cancel_sales_order",
+  remoteId: "excer-cancel-1",
+  referencedSalesOrderRemoteId: "excer-so-1",
+  cancellationDate: "2026-09-24",
+  reason: null,
+};
+const cancelledRow = `<VOUCHER><GUID>guid-abc</GUID><VOUCHERNUMBER>0012</VOUCHERNUMBER><ISCANCELLED>Yes</ISCANCELLED></VOUCHER>`;
+
+test("cancel: a live order is cancelled by its REMOTEID (live Tally answers ALTERED 1)", async () => {
+  const agent = await startAgent((xml) =>
+    collectionId(xml) === "Vouchers" ? importResult(`<ALTERED>1</ALTERED>`) : collection(voucherRow)
+  );
+  try {
+    const { status, body } = await agent.push(cancelOrder);
+    assert.equal(status, 200);
+    assert.equal(body.success, true);
+    const cancelXml = agent.requests.find((x) => collectionId(x) === "Vouchers") ?? "";
+    assert.match(cancelXml, /REMOTEID="excer-so-1"[^>]*ACTION="Cancel"/);
+  } finally {
+    await agent.close();
+  }
+});
+
+test("cancel: an order not in Tally is a clear 422, and nothing is sent", async () => {
+  const agent = await startAgent((xml) => {
+    if (collectionId(xml) === "Vouchers") throw new Error("must not send a cancel");
+    return collection("");
+  });
+  try {
+    const { status, body } = await agent.push(cancelOrder);
+    assert.equal(status, 422);
+    assert.match(body.error, /No Sales Order with REMOTEID "excer-so-1"/);
+  } finally {
+    await agent.close();
+  }
+});
+
+test("cancel: an already-cancelled order makes a retried cancel a duplicate, not a second write", async () => {
+  const agent = await startAgent((xml) => {
+    if (collectionId(xml) === "Vouchers") throw new Error("must not re-cancel");
+    return collection(cancelledRow);
+  });
+  try {
+    const { status, body } = await agent.push(cancelOrder);
+    assert.equal(status, 200);
+    assert.equal(body.duplicate, true);
+  } finally {
+    await agent.close();
+  }
+});
+
+test("real TallyPrime rejection (LINEERROR inside IMPORTRESULT, counted as EXCEPTIONS) is a 422", async () => {
+  // Verbatim shape of a live TallyPrime Edit Log response, 2026-09-24.
+  const rejected = importResult(
+    `<LINEERROR>Bad Order Number in Voucher!</LINEERROR><CREATED>0</CREATED><ERRORS>0</ERRORS><EXCEPTIONS>1</EXCEPTIONS>`
+  );
+  const agent = await startAgent((xml) => (collectionId(xml) === "Vouchers" ? rejected : collection("")));
+  try {
+    const { status, body } = await agent.push(salesOrder);
+    assert.equal(status, 422);
+    assert.equal(body.success, false);
+    assert.match(body.error, /Bad Order Number/);
+  } finally {
+    await agent.close();
+  }
+});
+
+test("an all-zero import result with no error is NOT reported as posted", async () => {
+  const agent = await startAgent((xml) =>
+    collectionId(xml) === "Vouchers" ? importResult("<CREATED>0</CREATED>") : collection("")
+  );
+  try {
+    const { status, body } = await agent.push(salesOrder);
+    assert.equal(status, 422);
+    assert.match(body.error, /wrote nothing/);
+  } finally {
+    await agent.close();
+  }
 });

@@ -1,0 +1,122 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { fetchLedgers, fetchStockItems } from "../src/excer/masters.js";
+import { loadAgentConfig } from "../src/excer/config.js";
+import { collection, fakeClient } from "./helpers.js";
+
+test("stock item names come through exactly — '007' is not turned into 7", async () => {
+  const { client } = fakeClient(() =>
+    collection(
+      `<STOCKITEM><GUID>g-1</GUID><NAME>007</NAME><ALTERID>3</ALTERID>` +
+        `<CLOSINGBALANCE>1,234.50 Nos</CLOSINGBALANCE><GSTRATE>18</GSTRATE></STOCKITEM>`
+    )
+  );
+  const [item] = await fetchStockItems(client, 0, "Test Co");
+  assert.equal(item.name, "007");
+  assert.equal(item.closingStockQty, 1234.5);
+  assert.equal(item.alterId, 3);
+  assert.equal(item.gstRate, 18);
+});
+
+function withEnv(env: Record<string, string | undefined>, fn: () => void) {
+  const saved: Record<string, string | undefined> = {};
+  for (const k of Object.keys(env)) {
+    saved[k] = process.env[k];
+    if (env[k] === undefined) delete process.env[k];
+    else process.env[k] = env[k];
+  }
+  try {
+    fn();
+  } finally {
+    for (const k of Object.keys(saved)) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
+}
+
+test("config: a weak or placeholder API key is refused at startup", () => {
+  withEnv({ AGENT_API_KEY: "change-me" }, () => assert.throws(loadAgentConfig, /too weak/));
+  withEnv({ AGENT_API_KEY: "short" }, () => assert.throws(loadAgentConfig, /too weak/));
+  withEnv({ AGENT_API_KEY: "a-long-enough-random-secret" }, () => assert.doesNotThrow(loadAgentConfig));
+});
+
+test("config: trailing slashes are stripped from the app URL", () => {
+  withEnv({ AGENT_API_KEY: "a-long-enough-random-secret", EXCER_APP_URL: "https://app.example.com//" }, () =>
+    assert.equal(loadAgentConfig().appBaseUrl, "https://app.example.com")
+  );
+});
+
+test("typed values from a targeted FETCH are unwrapped (real TallyPrime shape)", async () => {
+  // <GUID TYPE="String">…</GUID> etc. — previously these became JSON strings and AlterID 0.
+  const { client } = fakeClient(() =>
+    collection(
+      `<STOCKITEM NAME="Copper Cable 2.5mm"><GUID TYPE="String">abc-000000d7</GUID>` +
+        `<ALTERID TYPE="Number"> 217</ALTERID><BASEUNITS TYPE="String">Mtr</BASEUNITS>` +
+        `<CLOSINGBALANCE TYPE="Quantity"> 500.00 Mtr</CLOSINGBALANCE></STOCKITEM>`
+    )
+  );
+  const [item] = await fetchStockItems(client, 0, "Test Co");
+  assert.deepEqual([item.guid, item.alterId, item.baseUnit, item.closingStockQty], ["abc-000000d7", 217, "Mtr", 500]);
+});
+
+test("ledger state/GSTIN/address come from TallyPrime's dated lists, latest entry wins", async () => {
+  const { client } = fakeClient(() =>
+    collection(
+      `<LEDGER NAME="Probe Ledger"><GUID TYPE="String">g-da</GUID><ALTERID TYPE="Number"> 224</ALTERID>` +
+        `<LEDGSTREGDETAILS.LIST><APPLICABLEFROM>20200401</APPLICABLEFROM><GSTIN>33OLD</GSTIN></LEDGSTREGDETAILS.LIST>` +
+        `<LEDGSTREGDETAILS.LIST><APPLICABLEFROM>20260401</APPLICABLEFROM><GSTIN>33AABCC1234D1Z9</GSTIN></LEDGSTREGDETAILS.LIST>` +
+        `<LEDMAILINGDETAILS.LIST><ADDRESS.LIST TYPE="String"><ADDRESS>12 Anna Salai</ADDRESS><ADDRESS>Chennai</ADDRESS></ADDRESS.LIST>` +
+        `<APPLICABLEFROM>20260401</APPLICABLEFROM><PINCODE>600002</PINCODE><STATE>Tamil Nadu</STATE></LEDMAILINGDETAILS.LIST></LEDGER>`
+    )
+  );
+  const [row] = await fetchLedgers(client, 0, "Test Co");
+  assert.equal(row.ledgerName, "Probe Ledger");
+  assert.equal(row.gstin, "33AABCC1234D1Z9");
+  assert.equal(row.state, "Tamil Nadu");
+  assert.equal(row.addressLine, "12 Anna Salai, Chennai");
+  assert.equal(row.pincode, "600002");
+});
+
+test("stock item GST rate/HSN come from TallyPrime's dated GSTDETAILS/HSNDETAILS lists", async () => {
+  // Verbatim structure read back from a live TallyPrime Edit Log, 2026-09-24.
+  const gst = (rates: string) =>
+    `<GSTDETAILS.LIST><APPLICABLEFROM>20170701</APPLICABLEFROM><TAXABILITY>Taxable</TAXABILITY>` +
+    `<STATEWISEDETAILS.LIST><STATENAME>&#4; Any</STATENAME>${rates}</STATEWISEDETAILS.LIST></GSTDETAILS.LIST>`;
+  const rate = (head: string, r: string) =>
+    `<RATEDETAILS.LIST><GSTRATEDUTYHEAD>${head}</GSTRATEDUTYHEAD><GSTRATE> ${r}</GSTRATE></RATEDETAILS.LIST>`;
+  const { client } = fakeClient(() =>
+    collection(
+      `<STOCKITEM NAME="A">${gst(rate("CGST", "9") + rate("SGST/UTGST", "9") + rate("IGST", "18"))}` +
+        `<HSNDETAILS.LIST><APPLICABLEFROM>20170701</APPLICABLEFROM><HSNCODE>85444999</HSNCODE></HSNDETAILS.LIST></STOCKITEM>` +
+        `<STOCKITEM NAME="B">${gst(rate("CGST", "6") + rate("SGST/UTGST", "6"))}</STOCKITEM>` +
+        `<STOCKITEM NAME="C"><GSTRATE TYPE="Number"></GSTRATE></STOCKITEM>` +
+        `<STOCKITEM NAME="D"><GSTDETAILS.LIST><APPLICABLEFROM>20170701</APPLICABLEFROM><TAXABILITY>Exempt</TAXABILITY></GSTDETAILS.LIST></STOCKITEM>`
+    )
+  );
+  const items = await fetchStockItems(client, 0, "Test Co");
+  const byName = Object.fromEntries(items.map((i) => [i.name, i]));
+  assert.equal(byName.A.gstRate, 18);
+  assert.equal(byName.A.hsnCode, "85444999");
+  assert.equal(byName.B.gstRate, 12); // CGST + SGST when no IGST row
+  assert.equal(byName.C.gstRate, null); // unknown, NOT 0 — 0 would post the sale tax-free
+  assert.equal(byName.D.gstRate, 0); // genuinely exempt
+});
+
+test("base price is the SET standard selling price — never cost, never the last sale's rate", async () => {
+  // Verbatim live TallyPrime shapes: an item with a price list, and one without (whose computed
+  // $StandardPrice fell back to the last sale's 350 and whose OpeningRate is cost).
+  const { client } = fakeClient(() =>
+    collection(
+      `<STOCKITEM NAME="Priced"><OPENINGRATE TYPE="Rate">45.00/Mtr</OPENINGRATE>` +
+        `<STANDARDPRICELIST.LIST><DATE>20250401</DATE><RATE>55.00/Mtr</RATE></STANDARDPRICELIST.LIST>` +
+        `<STANDARDPRICELIST.LIST><DATE>20260401</DATE><RATE>60.00/Mtr</RATE></STANDARDPRICELIST.LIST></STOCKITEM>` +
+        `<STOCKITEM NAME="Unpriced"><OPENINGRATE TYPE="Rate">250.00/Nos</OPENINGRATE>` +
+        `<STANDARDPRICE TYPE="Rate">350.00/Nos</STANDARDPRICE><STANDARDPRICELIST.LIST> </STANDARDPRICELIST.LIST></STOCKITEM>`
+    )
+  );
+  const items = await fetchStockItems(client, 0, "Test Co");
+  const byName = Object.fromEntries(items.map((i) => [i.name, i]));
+  assert.equal(byName.Priced.baseRate, 60); // latest dated entry
+  assert.equal(byName.Unpriced.baseRate, null);
+});

@@ -24,7 +24,8 @@ export interface TallyStockItemRow {
   baseUnit: string;
   hsnCode?: string | null;
   gstRate?: number | null;
-  baseRate: number;
+  /** Standard selling price, ex-GST; null when none is set in Tally. */
+  baseRate: number | null;
   active: boolean;
 }
 
@@ -132,7 +133,7 @@ export const creditNotePayloadSchema = z.object({
   remoteId,
   referencedRemoteId: z.string().min(1),
   returnDate: date,
-  lineItems: z.array(lineItemSchema.omit({ hsnCode: true, unit: true })).min(1),
+  lineItems: z.array(lineItemSchema.omit({ hsnCode: true })).min(1),
   totalCreditAmount: nonNegativeMoney,
   reason: text,
   /** Required: a credit note posts against the customer, and Tally rejects an empty party. */
@@ -158,7 +159,8 @@ export const stockJournalPayloadSchema = z.object({
   itemGuid: text,
   rollBarcode: z.string().min(1),
   cutLength: money.positive(),
-  unit: z.string().min(1),
+  /** Tally's unit name for the item, or null/absent to use the item's own base unit. */
+  unit: text,
   remainingLength: money.nonnegative(),
   date,
 });
@@ -175,6 +177,14 @@ export const cancelSalesOrderPayloadSchema = z.object({
    * specific error message rather than a generic validation failure.
    */
   salesOrderVoucherNumber: text,
+  /**
+   * The Sales Order's own date (Order date, as sent in its push). Tally identifies the voucher to
+   * cancel by date + type + number, so this — not `cancellationDate` — must go in the cancel's
+   * DATE. It also lets the agent look up the voucher number by REMOTEID when
+   * `salesOrderVoucherNumber` is missing. Optional only for compatibility; without it the agent
+   * falls back to `cancellationDate`, which fails for any order not cancelled on its own day.
+   */
+  salesOrderDate: text,
 });
 
 export type LineItemPayload = z.infer<typeof lineItemSchema>;

@@ -72,7 +72,8 @@ From anywhere:
 curl https://tally.yourdomain.com/health
 ```
 
-You should get the agent's health JSON, with `"tallyReachable": true`.
+You should get `{"ok":true,"agentId":"…","tallyReachable":true}`. Without the API key that is all
+`/health` shows, on purpose — it is public. Add `-H "x-api-key: <AGENT_API_KEY>"` for details.
 
 ### 4. Point the app at it
 
@@ -81,10 +82,12 @@ In Vercel:
 ```
 TALLY_CONNECTOR_BASE_URL = https://tally.yourdomain.com
 TALLY_CONNECTOR_API_KEY  = <the AGENT_API_KEY from the agent's .env>
+TALLY_AGENT_TOKEN        = <the EXCER_APP_TOKEN from the agent's .env>
 ```
 
-Redeploy. `src/lib/tally/connector.ts` needs no code change — it was already written to call
-"some HTTP thing that speaks Tally."
+Redeploy. The first two let the website call the agent; the third lets the agent's deltas and
+heartbeats into the website (without it they get `401` and the admin panel shows the agent as
+never connected). No code change is needed.
 
 ---
 
@@ -121,4 +124,5 @@ deliberately or not at all.
 | `curl` to the hostname times out | Is the `cloudflared` service running? `Get-Service cloudflared` |
 | 502 from Cloudflare | Tunnel is up, agent is down. `curl http://127.0.0.1:7010/health` on the PC |
 | 401 from the agent | `TALLY_CONNECTOR_API_KEY` in Vercel doesn't match `AGENT_API_KEY` in `.env` |
+| Admin panel: agent "never connected", agent log shows HTTP 401 | `TALLY_AGENT_TOKEN` in Vercel doesn't match `EXCER_APP_TOKEN` in `.env` |
 | Works, then stops after a reboot | cloudflared didn't install as a service — re-run the dashboard install command |

@@ -13,9 +13,11 @@
 //      could cancel a different order. So after a successful import we read the voucher back by
 //      REMOTEID and return its actual GUID and VOUCHERNUMBER.
 //
-// UNVERIFIED against a live Tally: the `$RemoteID` / `$RemoteAltGUID` method names, and whether a
-// Voucher collection includes Optional vouchers. `npm run doctor` runs both lookups read-only;
-// the first test-company push confirms the round-trip.
+// VERIFIED against a live TallyPrime Edit Log (2026-09-24): the REMOTEID we send as a <VOUCHER>
+// attribute reads back as `$RemoteGUID` (NOT `$RemoteID`, which never matches); a ledger's
+// REMOTEALTGUID reads back as `$RemoteAltGUID`. The SVFROMDATE/SVTODATE scope did not restrict the
+// voucher lookup on that build — it found the voucher from another date — so the lookup is safe
+// even if a date is off, at the cost of scanning the company's vouchers.
 
 import type { TallyClient } from "../tally/client.js";
 import { buildExportCollectionEnvelope, escapeXml, parseTallyXmlAsStrings } from "../tally/xml.js";
@@ -40,39 +42,45 @@ function collectionRows(xml: string, tag: string): any[] {
 
 export interface VoucherIdentity {
   guid: string;
+  /**
+   * Informational only — NOT an identifier. Verified live: Tally gives Optional vouchers
+   * non-unique numbers (two Optional credit notes were both "6"), and a Sales Order type can have
+   * no numbering at all. Anything that must find a voucher again uses its REMOTEID.
+   */
   voucherNumber: string | null;
+  cancelled: boolean;
 }
 
 /**
- * Find a voucher by the REMOTEID we stamped on it.
- *
- * Scoped to the voucher's own date (SVFROMDATE = SVTODATE = date): Voucher collections are bounded
- * by the period, so this scans one day's vouchers instead of the whole company's history.
+ * Find a voucher by the REMOTEID we stamped on it. `date`, when known, is passed as the report
+ * period; on the verified build it did not narrow the search, so a missing or wrong date is safe.
  */
 export async function findVoucherByRemoteId(
   client: TallyClient,
   remoteId: string,
-  date: string,
+  date: string | null,
   company?: string
 ): Promise<VoucherIdentity | null> {
   const xml = buildExportCollectionEnvelope({
     collectionName: "ExcerVoucherByRemoteId",
-    staticVariables: { company, fromDate: date, toDate: date },
+    staticVariables: { company, ...(date ? { fromDate: date, toDate: date } : {}) },
     tdlMessage: `
       <COLLECTION NAME="ExcerVoucherByRemoteId" ISMODIFY="No">
         <TYPE>Voucher</TYPE>
         <FETCH>GUID</FETCH>
         <FETCH>VoucherNumber</FETCH>
-        <FETCH>RemoteID</FETCH>
+        <FETCH>RemoteGUID</FETCH>
+        <FETCH>IsCancelled</FETCH>
         <FILTER>ExcerMatchRemoteId</FILTER>
       </COLLECTION>
-      <SYSTEM TYPE="Formulae" NAME="ExcerMatchRemoteId">$RemoteID = ${tdlString(remoteId)}</SYSTEM>`,
+      <SYSTEM TYPE="Formulae" NAME="ExcerMatchRemoteId">$RemoteGUID = ${tdlString(remoteId)}</SYSTEM>`,
   });
   const row = collectionRows(await client.send(xml), "VOUCHER")[0];
   if (!row) return null;
   return {
     guid: s(row.GUID ?? row["@_GUID"]),
     voucherNumber: s(row.VOUCHERNUMBER) || null,
+    cancelled: s(row.ISCANCELLED).toLowerCase() === "yes",
   };
 }
 

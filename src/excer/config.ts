@@ -88,11 +88,26 @@ function bool(name: string, fallback: boolean): boolean {
   throw new Error(`Invalid ${name}: ${raw}. Expected true/false.`);
 }
 
+/** The key guards an endpoint that writes to the accounting books, reachable from the internet. */
+const MIN_API_KEY_LENGTH = 16;
+
+function apiKey(): string {
+  const key = required("AGENT_API_KEY");
+  if (key === "change-me" || key.length < MIN_API_KEY_LENGTH) {
+    throw new Error(
+      `AGENT_API_KEY is too weak: use a random secret of at least ${MIN_API_KEY_LENGTH} characters ` +
+        `(e.g. the output of: node -e "console.log(crypto.randomBytes(32).toString('hex'))").`
+    );
+  }
+  return key;
+}
+
 export function loadAgentConfig(): AgentConfig {
   return {
     port: int("AGENT_PORT", 7010),
-    apiKey: required("AGENT_API_KEY"),
-    appBaseUrl: process.env.EXCER_APP_URL?.trim() || undefined,
+    apiKey: apiKey(),
+    // No trailing slash: paths are appended as "/api/...", and "//api" can redirect or 404.
+    appBaseUrl: process.env.EXCER_APP_URL?.trim().replace(/\/+$/, "") || undefined,
     appToken: process.env.EXCER_APP_TOKEN?.trim() || undefined,
     pollIntervalMs: int("POLL_INTERVAL_MS", 15_000),
     heartbeatIntervalMs: int("HEARTBEAT_INTERVAL_MS", 30_000),

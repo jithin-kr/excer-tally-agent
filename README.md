@@ -32,8 +32,13 @@ from their network. No firewall changes, no port forwarding, no static IP.
  └──────────────────────────────┘
 ```
 
-**Read is ~15 seconds behind. Write is 1–3 seconds.** That asymmetry is Tally's design, not ours:
-we can call Tally whenever we like, but Tally can never call us, so reads are polling.
+**Writes take 1–3 seconds. Reads lag:** master changes (customers, items) about 15 seconds, stock
+moved by vouchers up to about a minute. That asymmetry is Tally's design, not ours: we can call
+Tally whenever we like, but Tally can never call us, so reads are polling.
+
+Full documentation is in [`docs/`](docs/): [prd](docs/prd.md) (what and why) ·
+[architecture](docs/architecture.md) · [design](docs/design.md) (API and Tally XML) ·
+[rules](docs/rules.md) (for changing the code) · [memory](docs/memory.md) (facts and traps).
 
 ---
 
@@ -41,22 +46,25 @@ we can call Tally whenever we like, but Tally can never call us, so reads are po
 
 | Path | What it does |
 |---|---|
-| `src/tally/client.ts` | POSTs XML to Tally (one request at a time), parses failure envelopes |
-| `src/tally/xml.ts` | Export/Import envelopes, date + escaping helpers |
-| `src/tally/util.ts` | Tally value coercion (`"42 Nos"` → `42`) |
-| `src/tally/voucher-render.ts` | Generic voucher/ledger/inventory XML, with `REMOTEID` / `ISOPTIONAL` |
-| `src/excer/contract.ts` | The wire contract with the Next.js app |
-| `src/excer/config.ts` | Agent config + all installation-specific Tally names |
-| `src/excer/vouchers.ts` | The six Excer payloads → Tally XML |
-| `src/excer/masters.ts` | AlterID-based incremental read |
-| `src/excer/lookup.ts` | Find a written voucher/ledger: duplicate check + real voucher number |
-| `src/server.ts` | The two HTTP endpoints the app calls |
+| `src/index.ts` | Entry point: config, Tally client, server, poll loop, heartbeat; process safety nets |
+| `src/server.ts` | The HTTP endpoints; push flow (check → write → read back); `/health` |
 | `src/poll-loop.ts` | Two-stage "has anything changed?" polling, on both AlterID counters |
 | `src/state-store.ts` | Persists the poll watermarks across restarts |
+| `src/heartbeat.ts` | Liveness reporting to the website |
+| `src/doctor.ts` | `npm run doctor`: read-only checks against a real Tally |
 | `src/log.ts` | Timestamped logging; one audit line per push |
-| `test/` | `npm test` — node:test against a fake Tally, no Tally needed |
-| `src/heartbeat.ts` | Liveness reporting |
-| `src/doctor.ts` | Day-one validation against a real Tally |
+| `src/excer/contract.ts` | The wire contract with the website (zod schemas) |
+| `src/excer/config.ts` | Agent config + every installation-specific Tally name |
+| `src/excer/vouchers.ts` | The six Excer payloads → Tally XML; GST split; discount reconciliation |
+| `src/excer/masters.ts` | Counters, stock items (stock, GST, HSN, selling price), customer ledgers |
+| `src/excer/lookup.ts` | Find what we wrote: voucher by REMOTEID, ledger by name |
+| `src/tally/client.ts` | POSTs XML to Tally, one request at a time; failure envelopes |
+| `src/tally/xml.ts` | Collection-export and import envelopes, escaping, dates, result parsing |
+| `src/tally/util.ts` | Value coercion; unwraps Tally's typed values |
+| `src/tally/voucher-render.ts` | Generic voucher/ledger/inventory XML, with `REMOTEID` / `ISOPTIONAL` |
+| `test/` | `npm test`: node:test against a fake Tally built from real responses |
+| `install/` | Windows service installer; install and tunnel runbooks |
+| `docs/` | Requirements, architecture, interfaces, coding rules, project memory |
 
 ---
 
@@ -66,6 +74,7 @@ we can call Tally whenever we like, but Tally can never call us, so reads are po
 npm install
 cp .env.example .env      # then edit it
 npm run build
+npm test                  # no Tally needed
 npm run doctor            # verify against a real Tally BEFORE anything else
 npm start
 ```
@@ -77,8 +86,9 @@ would expose an agent that can write to the accounting books to the entire offic
 
 ## The endpoints
 
-Both mirror the dev fixture at `src/app/api/dev-fake-tally/` in the main repo, so pointing
-`TALLY_CONNECTOR_BASE_URL` at this agent instead of at the fixture is a pure config change.
+The website's dev fixture (`src/app/api/dev-fake-tally/`) serves the same paths, so pointing
+`TALLY_CONNECTOR_BASE_URL` at this agent instead is a config change. Status codes and response
+bodies are specified in [docs/design.md](docs/design.md).
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
@@ -88,23 +98,33 @@ Both mirror the dev fixture at `src/app/api/dev-fake-tally/` in the main repo, s
 
 ### Idempotency
 
-Every voucher carries `<REMOTEID>`, built by `buildTallyRemoteId()` in the main app. Before
-writing, the agent looks the REMOTEID up in Tally (`src/excer/lookup.ts`); if the voucher is
-already there it returns `{ duplicate: true }` **without re-importing** — which the app treats as
-**success**, because the voucher it wanted does exist in Tally. Checking first matters because a
-re-import carrying a known REMOTEID may *alter* the existing voucher rather than be ignored, e.g.
-flipping one the accountant already converted to Regular back to Optional.
+Every voucher carries a REMOTEID — built by `buildTallyRemoteId()` in the main app — stamped as an
+**attribute** of `<VOUCHER>`. (As a child element, Tally silently discards it and stamps its own
+GUID — verified live.) Tally stores it, readable back as `$RemoteGUID`.
+
+Before writing, the agent looks the REMOTEID up (`src/excer/lookup.ts`). If the voucher is already
+there it returns `{ duplicate: true }` **without re-importing** — success, because the voucher the
+app wanted exists. Checking first is essential, not defensive: a re-import with a known REMOTEID
+**alters** that voucher (verified live: `ALTERED 1`), which would overwrite an accountant's edits.
+Pushes are also run one at a time, so two retries of the same job can't both pass the check.
 
 New customer ledgers are checked by name. Same name + same REMOTEALTGUID is a duplicate; same name
 belonging to a **different** customer is a `409` — never reported as success.
 
-### Voucher numbers
+### Identifiers and cancelling
 
-After a successful write the agent reads the voucher back and returns its real `GUID` and
-`VOUCHERNUMBER`. It used to return Tally's `LASTVCHID`, which is an internal id, not the voucher
-number — and the app sends that value back to cancel, so cancelling could hit a different order.
-If the read-back finds nothing, `voucherNumber` is omitted and the push log says so; cancelling
-that order then fails with a clear error rather than guessing.
+After a write the agent reads the voucher back and returns its real `GUID` (and `voucherNumber`,
+informational only). Voucher numbers **cannot identify a voucher**: Tally gives Optional vouchers
+non-unique numbers (two Optional credit notes were both "6", later both "7"), and a Sales Order
+type may have no numbering at all. So a cancel targets the Sales Order by its **REMOTEID**
+(`<VOUCHER REMOTEID="…" ACTION="Cancel">` — verified live, no date or number needed). The agent
+first checks the order exists (else a clear `422`) and isn't already cancelled (else `duplicate`).
+
+### Success means Tally wrote something
+
+Live TallyPrime reports import results in `<IMPORTRESULT>`, counts a rejected voucher under
+`EXCEPTIONS` (not `ERRORS`), and puts `LINEERROR` inside it. A result is success only if Tally
+created, altered, combined or cancelled something; anything else is a `422` with Tally's reason.
 
 ### Payload validation
 
@@ -139,9 +159,9 @@ buyer (`gstin` and/or `state`), and the configured `homeState`.
    state code would imply. The GSTIN is used only to *derive* a state when no free-text state is
    on file at all (via the CBIC two-digit state code table in `vouchers.ts`).
 2. **Both missing, or an unrecognised GSTIN code with no state** → throws. Blocks the push until
-   someone fixes the customer's address/GSTIN in the admin panel — discovered today, not misfiled
-   in the client's books and discovered by an accountant months later. The job retries
-   automatically once the record is fixed (`MAX_AUTO_RETRY_ATTEMPTS`, main repo CLAUDE.md §22.10).
+   someone fixes the customer's address/GSTIN in the admin panel — found at once, not misfiled
+   in the client's books and discovered by an accountant months later. The website rebuilds the
+   payload on every retry, so the job goes through once the record is fixed.
 3. **Rounding**: SGST is computed as the remainder (`taxTotal - cgst`), not independently rounded,
    so the two halves always sum to exactly `taxTotal` regardless of an odd paisa — verified with a
    ₹495.90 tax total (the real order that surfaced this) splitting to ₹247.95 / ₹247.95 exactly.
@@ -151,65 +171,57 @@ the conflict, rounding, and both throw paths) are in `test/vouchers.test.ts` —
 
 ---
 
-## Required changes in the main app — DONE (2026-09-23)
+## The website's side
 
-Found while building the agent against the existing payload builders in
-`src/features/tally/mapping.ts`. All five are now done on the excer-global side (see its
-CLAUDE.md §22.5 for the file-level detail); only #5 needs a further deployment step once a tunnel
-hostname exists.
+Changes in excer-global, recorded in its CLAUDE.md §39. **Made and tested (682 unit tests), but not
+yet committed there** — that working tree has other work in progress:
 
-1. ✅ **`buildCancelVoucherPayload` includes the voucher number.** Tally cancels a voucher by its
-   **voucher number**, not by REMOTEID. `salesOrderVoucherNumber` is now sent, read from
-   `Order.tallyVoucherNumber`.
-2. ✅ **`buildDeliveryNotePayload` sends `buyerLedgerName` and `referencedVoucherNumber`.** A
-   delivery note still posts against the customer and references its sales order.
-3. ✅ **`buildCreditNotePayload` sends `buyerLedgerName` and `buyerGstin`.** The ledger name to
-   post against, and the GSTIN so the tax reversal can pick CGST+SGST vs IGST.
-4. ✅ **Two new routes exist**: `POST /api/tally/pull` (accepts master deltas) and
-   `POST /api/tally/heartbeat` (accepts liveness). Both bearer-authenticated
-   (`TALLY_AGENT_TOKEN` on the app side must match this agent's `EXCER_APP_TOKEN`), and both
-   were added to the app's proxy's public-route allowlist so an unauthenticated call gets a real
-   401 instead of a 307 to `/login`.
-5. ⬜ **`connector.ts`**: still needs `TALLY_CONNECTOR_BASE_URL` pointed at the tunnel hostname
-   once one exists — a deployment step, not code. Mock mode still works for local development.
-
-None of this has been run against this agent talking to a real Tally, or against a real tunnel
-deployment — see "Not yet verified against a real Tally" below, which is unchanged by this.
+1. ✅ Pull/heartbeat routes, bearer-authenticated (`TALLY_AGENT_TOKEN` = this agent's
+   `EXCER_APP_TOKEN`), constant-time token check.
+2. ✅ **GST-inclusive prices are split, not added to.** Our prices include GST; the Sales Order
+   payload used to add GST on top (every taxed order ~18% too high in Tally), and the Credit Note
+   sent the inclusive refund as the taxable value (no GST reversed). A line whose GST rate is
+   unknown blocks the push with a clear message instead of going out tax-free.
+3. ✅ **Units are Tally's own** (`Product.tallyBaseUnit`), never "m"/"pcs", which Tally rejects;
+   null sends a bare quantity (Tally uses the item's base unit — verified live).
+4. ✅ Sales Order / Credit Note payloads are **rebuilt from current data on every push attempt**, so
+   fixing a customer's state or a product's GST rate lets the next retry succeed.
+5. ✅ `400`/`409` are permanent (no auto-retry); `422`/`502` retry. Timeout on agent calls.
+6. ✅ A successful push with no GUID stamps the REMOTEID, so dependent jobs are never stranded.
+7. ✅ The pull is batched (one query per master kind), writes only what changed, and counts
+   unlinked Tally items instead of logging each as an error — the agent re-sends all stock after
+   stock-moving vouchers. Fractional stock is rounded down (`stockLevel` is an Int). The base
+   price = Tally's standard selling price + GST, touched only when the item master changed.
+8. ⬜ Deployment: point `TALLY_CONNECTOR_BASE_URL` at the tunnel hostname.
 
 ---
 
-## Not yet verified against a real Tally
+## Verified against a live TallyPrime (2026-09-24)
 
-This agent has **never been run against a live Tally installation**. It typechecks, builds, serves, and rejects bad input correctly. That is all it
-currently proves.
+TallyPrime Edit Log (Educational mode), test company, through the agent end to end, plus payloads
+built by the website's own mapping code:
 
-Verify each of these before trusting the agent with real books:
+- ✅ Counters (`ALTMSTID`/`ALTVCHID`), `$AlterID > n` filters, incremental + voucher-driven
+  stock sync to the website within 5–60s; heartbeat.
+- ✅ Typed values (`<X TYPE="…">`) unwrapped — they used to parse as JSON garbage / 0.
+- ✅ Customers: state/address in dated `LEDMAILINGDETAILS.LIST`, GSTIN in `LEDGSTREGDETAILS.LIST`
+  (flat tags are silently ignored by this TallyPrime); sub-group customers included
+  (`$$IsBelongsTo`, not `$Parent =`); create / retry-duplicate / name-clash `409`.
+- ✅ Stock items: GST rate from `GSTDETAILS.LIST` (flat `GSTRate` is empty), HSN from
+  `HSNDETAILS.LIST`, selling price from the set `STANDARDPRICELIST` — not `OpeningRate` (cost)
+  nor `$StandardPrice` (falls back to the last sale's rate).
+- ✅ Credit Note (CGST+SGST and IGST), Delivery Note, Stock Journal: created, correct postings read
+  back, retries caught before writing. Invoice layout = `LEDGERENTRIES.LIST` + sales only via
+  the item allocations; returns are debits; Stock Journal needs `INVENTORYENTRIESOUT/IN.LIST`.
+- ✅ `ISOPTIONAL` posts Optional vouchers, which don't touch stock until converted.
+- ✅ Cancel by REMOTEID.
+- ❌ **Sales Order: still rejected — `Bad Order Number in Voucher!`** in every layout tried, even
+  after enabling order processing. Needs one Sales Order entered by hand in Tally to copy its
+  exact XML. Until then Sales Orders fail as a clear `422` (retried), never as a false success.
 
-- [ ] `<REMOTEID>` is accepted on vouchers and does suppress duplicates. TallyConnector's captured
-      fixtures use `<REMOTEALTGUID>` for **masters**; `<REMOTEID>` is the documented **voucher**
-      field. We may need both.
-- [ ] The Company object exposes `ALTMSTID` / `ALTVCHID`. **Incremental sync depends entirely on
-      this.** `npm run doctor` fails if they come back as 0, and the poll loop refuses to run.
-- [ ] `ALTVCHID` moves when a voucher is entered, and a purchase voucher's stock change shows up on
-      the website within ~15s–60s.
-- [ ] The REMOTEID lookup (`$RemoteID` filter, `src/excer/lookup.ts`) finds a voucher we pushed —
-      **including an Optional one**. Proof: the first test-company push's log line shows
-      `vch=<number>`, not `vch=?`, and pushing the same payload again logs `duplicate`.
-- [ ] The ledger lookup returns `REMOTEALTGUID` for a ledger we created (otherwise a retried
-      new-customer push is a 409 instead of a duplicate).
-- [ ] `$AlterID > n` works as a collection `FILTER` on this Tally build.
-- [ ] Stock Journal XML — cable cuts may need `SOURCELIST`/`DESTINATIONLIST` rather than the flat
-      `ALLINVENTORYENTRIES.LIST` this renders.
-- [ ] Field names on stock items: `OpeningRate` for base price, whether `HSNCode` lives on the
-      item or the stock **group**.
-- [ ] Every name in `.env.example`'s bottom section — voucher types, ledgers, the customer group.
-      The defaults are Tally's out-of-the-box names and are very likely wrong here.
-- [ ] `<ISOPTIONAL>Yes</ISOPTIONAL>` (added 2026-09-23, `TALLY_POST_VOUCHERS_AS_OPTIONAL`) actually
-      posts to the Optional Vouchers register instead of being silently ignored — and whether
-      Tally's Cancel action applies cleanly to an Optional voucher the accountant hasn't converted
-      to Regular yet. This flag exists because the main app's push is now fully automatic rather
-      than triggered by an admin clicking a button, so Optional is the new human-review gate — see
-      the main repo's CLAUDE.md §22.9.
+Still to check on the client's real Tally: every name in `.env.example`'s bottom section, and
+whether GST rates/HSN are set on items or inherited from stock groups (inherited → `gstRate` null →
+orders with those items wait for the rate, by design).
 
 Post your first voucher into a **test company**, never the live one.
 

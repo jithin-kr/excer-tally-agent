@@ -101,38 +101,9 @@ function renderStaticVariables(vars: StaticVariables | undefined): string {
 /*  EXPORT envelopes                                                          */
 /* -------------------------------------------------------------------------- */
 
-export interface ExportDataOptions {
-  /** Report / data ID — e.g. "Trial Balance", "Day Book", "List of Accounts". */
-  reportId: string;
-  staticVariables?: StaticVariables;
-  /** Raw TDL message body — inserted inside <TDL><TDLMESSAGE>...</TDLMESSAGE></TDL>. */
-  tdlMessage?: string;
-  /** Optional FETCH list (for OBJECT export). */
-  fetchList?: string[];
-}
-
-export function buildExportEnvelope(opts: ExportDataOptions): string {
-  const desc = [
-    renderStaticVariables(opts.staticVariables),
-    opts.fetchList && opts.fetchList.length
-      ? `<FETCHLIST>${opts.fetchList.map((f) => `<FETCH>${escapeXml(f)}</FETCH>`).join("")}</FETCHLIST>`
-      : "",
-    opts.tdlMessage ? `<TDL><TDLMESSAGE>${opts.tdlMessage}</TDLMESSAGE></TDL>` : "",
-  ].filter(Boolean).join("");
-
-  return [
-    `<?xml version="1.0" encoding="UTF-8"?>`,
-    `<ENVELOPE>`,
-    `<HEADER>`,
-    `<VERSION>1</VERSION>`,
-    `<TALLYREQUEST>Export</TALLYREQUEST>`,
-    `<TYPE>Data</TYPE>`,
-    `<ID>${escapeXml(opts.reportId)}</ID>`,
-    `</HEADER>`,
-    `<BODY><DESC>${desc}</DESC></BODY>`,
-    `</ENVELOPE>`,
-  ].join("");
-}
+// Only Collection exports are used: every read defines its own TDL collection, so it can FETCH
+// exactly the fields it needs and FILTER on AlterID/REMOTEID. (Upstream's Data-report and Object
+// export envelopes were removed as unused.)
 
 export interface ExportCollectionOptions {
   collectionName: string;
@@ -154,40 +125,6 @@ export function buildExportCollectionEnvelope(opts: ExportCollectionOptions): st
     `<TALLYREQUEST>Export</TALLYREQUEST>`,
     `<TYPE>Collection</TYPE>`,
     `<ID>${escapeXml(opts.collectionName)}</ID>`,
-    `</HEADER>`,
-    `<BODY><DESC>${desc}</DESC></BODY>`,
-    `</ENVELOPE>`,
-  ].join("");
-}
-
-export interface ExportObjectOptions {
-  /** Object subtype, e.g. "Ledger", "Group", "StockItem", "Voucher". */
-  subType: string;
-  /** Identifier (usually the name). */
-  id: string;
-  /** Identifier qualifier — default "Name". */
-  idType?: string;
-  fetchList?: string[];
-  staticVariables?: StaticVariables;
-}
-
-export function buildExportObjectEnvelope(opts: ExportObjectOptions): string {
-  const desc = [
-    renderStaticVariables(opts.staticVariables),
-    opts.fetchList && opts.fetchList.length
-      ? `<FETCHLIST>${opts.fetchList.map((f) => `<FETCH>${escapeXml(f)}</FETCH>`).join("")}</FETCHLIST>`
-      : "",
-  ].filter(Boolean).join("");
-
-  return [
-    `<?xml version="1.0" encoding="UTF-8"?>`,
-    `<ENVELOPE>`,
-    `<HEADER>`,
-    `<VERSION>1</VERSION>`,
-    `<TALLYREQUEST>Export</TALLYREQUEST>`,
-    `<TYPE>Object</TYPE>`,
-    `<SUBTYPE>${escapeXml(opts.subType)}</SUBTYPE>`,
-    `<ID TYPE="${escapeXml(opts.idType ?? "Name")}">${escapeXml(opts.id)}</ID>`,
     `</HEADER>`,
     `<BODY><DESC>${desc}</DESC></BODY>`,
     `</ENVELOPE>`,
@@ -267,6 +204,8 @@ export interface ImportResult {
   combined: number;
   ignored: number;
   errors: number;
+  /** EXCER: TallyPrime counts a rejected voucher here, not in ERRORS (verified live). */
+  exceptions: number;
   cancelled: number;
   lastVchId: number;
   lastMId: number;
@@ -278,15 +217,23 @@ export interface ImportResult {
 export function parseImportResult(xml: string): ImportResult {
   const tree = parser.parse(xml);
   const env = tree?.ENVELOPE ?? tree;
+  // EXCER: TallyPrime (verified against a live TallyPrime Edit Log, 2026-09-24) answers imports
+  // with <BODY><DATA><IMPORTRESULT>. Without this first branch every count parsed as 0, so an
+  // import that failed without a LINEERROR looked like a success. <RESPONSE> is kept for older builds.
   const resp =
+    env?.BODY?.DATA?.IMPORTRESULT ??
     env?.BODY?.DATA?.RESPONSE ??
     env?.RESPONSE ??
     env?.BODY?.DATA ??
     {};
-  const lineError =
-    env?.BODY?.DATA?.LINEERROR ??
-    env?.LINEERROR ??
-    undefined;
+  // EXCER: live TallyPrime puts LINEERROR *inside* <IMPORTRESULT> and counts the rejection under
+  // EXCEPTIONS — missing both made a rejected Sales Order read as a success. Several rows can each
+  // carry an error, so collect them all.
+  const lineErrors = [resp?.LINEERROR, env?.BODY?.DATA?.LINEERROR, env?.LINEERROR]
+    .flatMap((e) => (e === undefined || e === null ? [] : Array.isArray(e) ? e : [e]))
+    .map((e) => String(e).trim())
+    .filter(Boolean);
+  const lineError = lineErrors.length ? [...new Set(lineErrors)].join("; ") : undefined;
   return {
     created: Number(resp.CREATED ?? 0) || 0,
     altered: Number(resp.ALTERED ?? 0) || 0,
@@ -294,10 +241,11 @@ export function parseImportResult(xml: string): ImportResult {
     combined: Number(resp.COMBINED ?? 0) || 0,
     ignored: Number(resp.IGNORED ?? 0) || 0,
     errors: Number(resp.ERRORS ?? 0) || 0,
+    exceptions: Number(resp.EXCEPTIONS ?? 0) || 0,
     cancelled: Number(resp.CANCELLED ?? 0) || 0,
     lastVchId: Number(resp.LASTVCHID ?? 0) || 0,
     lastMId: Number(resp.LASTMID ?? 0) || 0,
-    lineError: lineError ? String(lineError) : undefined,
+    lineError,
     raw: xml,
   };
 }
