@@ -32,6 +32,10 @@ export interface TallyStockItemRow {
    * item sits directly under Tally's root ("Primary"). The website files the item by it.
    */
   stockGroupPath?: string[];
+  /** Tally's closing rate per unit (its stock valuation, e.g. average cost), or null if none. */
+  closingRate?: number | null;
+  /** Tally's closing stock value in rupees, as its Stock Summary shows it (positive for stock held). */
+  closingValue?: number | null;
 }
 
 export interface TallyLedgerRow {

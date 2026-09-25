@@ -91,6 +91,8 @@ export async function fetchStockItems(
         <FETCH>StandardPriceList</FETCH>
         <FETCH>IsDeleted</FETCH>
         <FETCH>Parent</FETCH>
+        <FETCH>ClosingRate</FETCH>
+        <FETCH>ClosingValue</FETCH>
         ${filterTag}
       </COLLECTION>
       ${systemTag}`,
@@ -119,6 +121,9 @@ export async function fetchStockItems(
     baseRate: rateOrNull(latestByDate(row?.["STANDARDPRICELIST.LIST"])?.RATE),
     active: s(row?.ISDELETED).toLowerCase() !== "yes",
     stockGroupPath: groupPath(text(row?.PARENT)),
+    // Tally's own valuation, so the website's Stock Summary matches Tally's to the paisa.
+    closingRate: rateOrNull(row?.CLOSINGRATE),
+    closingValue: closingValue(row?.CLOSINGVALUE),
   }));
 }
 
@@ -166,6 +171,15 @@ function latestByDate(list: unknown): any | null {
 }
 
 /** A Tally rate like "60.00/Mtr" as a number, or null when empty. */
+/**
+ * Tally exports amounts with debit as negative, and stock is a debit: 7,208 Pcs worth ₹52,082.99
+ * arrives as "-52082.99" (verified live, 2026-09-25). Flipped so stock held reads positive.
+ */
+function closingValue(v: unknown): number | null {
+  const digits = s(v).replace(/[^\d.-]/g, "");
+  return digits === "" ? null : -n(digits) || 0;
+}
+
 function rateOrNull(v: unknown): number | null {
   const digits = s(v).split("/")[0].replace(/[^\d.-]/g, "");
   return digits === "" ? null : n(digits);

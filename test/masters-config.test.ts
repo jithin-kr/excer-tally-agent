@@ -172,3 +172,23 @@ test("each stock item carries its stock-group path, top level first, without Tal
     [["Cable", "AC Cable"], ["Solar Accessories"], []]
   );
 });
+
+test("closing rate and value come through as Tally's Stock Summary shows them", async () => {
+  const { client } = fakeClient((xml) =>
+    collectionId(xml) === "ExcerStockGroups"
+      ? collection("")
+      : collection(
+          // Live shapes: the value is a debit, so Tally sends it negative.
+          `<STOCKITEM NAME="Tubular Terminal End 10 Sq.mm Copper"><GUID>g-1</GUID>` +
+            `<CLOSINGBALANCE TYPE="Quantity"> 7208 Pcs</CLOSINGBALANCE>` +
+            `<CLOSINGVALUE TYPE="Amount">-52082.99</CLOSINGVALUE>` +
+            `<CLOSINGRATE TYPE="Rate">7.23/Pcs</CLOSINGRATE></STOCKITEM>` +
+            `<STOCKITEM NAME="No Stock"><GUID>g-2</GUID><CLOSINGVALUE TYPE="Amount"></CLOSINGVALUE></STOCKITEM>`
+        )
+  );
+  const [item, empty] = await fetchStockItems(client, 0, "Test Co");
+  assert.equal(item.closingRate, 7.23);
+  assert.equal(item.closingValue, 52082.99);
+  assert.equal(empty.closingRate, null);
+  assert.equal(empty.closingValue, null);
+});
