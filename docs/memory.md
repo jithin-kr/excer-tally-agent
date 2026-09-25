@@ -38,6 +38,10 @@ changes back, through a Cloudflare Tunnel so nothing is exposed. See [prd.md](pr
   F1 → Settings → Connectivity → Client/Server → "Both", port 9000. `tally.ini` showing
   `Client Server=None` means it is off.
 - The XML interface **cannot create or open a company**; that is done in Tally's UI.
+- **Client company copy** (2026-09-25): `EXCER GLOBAL PRIVATE LIMITED - (26-27)`, number 700026,
+  loaded from `C:\Users\Public\TallyPrimeEditLog\data\700026` (repaired + migrated; the untouched
+  original is `700026/` in this repo, git-excluded). Synced to the local website with
+  `AGENT_STATE_FILE=state/poll-state-700026.json`.
 - Test company **`Jz`** (Kerala, GST on, order processing enabled via XML) holds mock masters and
   test vouchers: customers Kochi Traders (Kerala), Chennai Electricals (Tamil Nadu), Walk-in
   Customer, Thrissur Hardware (sub-group), Probe Ledger; items Copper Cable 2.5mm / 4mm (Mtr),
@@ -82,6 +86,19 @@ changes back, through a Cloudflare Tunnel so nothing is exposed. See [prd.md](pr
 - Computed Tally methods fall back silently: `$StandardPrice` → last sale's rate,
   `$StandardCost` → opening rate.
 - `process.exit()` with open undici sockets trips a libuv assertion on Windows (exit code 127).
+- **Tally keeps line breaks typed into names and addresses** and sends them as `&#13;&#10;`.
+  fast-xml-parser decodes those only with `htmlEntities`, and trims *before* decoding, so display
+  text goes through `text()` (collapse whitespace). Found on the client's data.
+- **fast-xml-parser stops after 1000 decoded references per response**, counting every `&amp;`.
+  One export of the client's masters exceeded it and the whole poll failed; the total is lifted.
+- **The first sync of a real company is slow**: the client's full master set took ~2.5 min in the
+  website's pull route. With the old fixed 15s timeout the agent aborted and retried while the
+  website kept processing, so overlapping batches raced to create the same drafts
+  (`products_code_key` errors, end state correct). `APP_TIMEOUT_MS` is now configurable.
+- **A company copied while Tally is open is damaged**: Tally shows only "Error Code: 6010" on
+  load. Leftover `TUPDATE.TSF` / `TDBK*.001` files are the sign. Data → Repair fixed it with no
+  loss; Tally then migrates the copy's data format on first load. Both offer a TallyDrive (cloud)
+  backup first — switch it off for client data.
 
 ## 7. Open items
 

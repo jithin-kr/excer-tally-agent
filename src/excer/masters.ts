@@ -16,7 +16,7 @@
 
 import type { TallyClient } from "../tally/client.js";
 import { buildExportCollectionEnvelope, escapeXml, parseTallyXmlAsStrings } from "../tally/xml.js";
-import { asArray, n, s } from "../tally/util.js";
+import { asArray, n, s, text } from "../tally/util.js";
 import type { TallyLedgerRow, TallyStockItemRow } from "./contract.js";
 
 /* -------------------------------------------------------------------------- */
@@ -99,8 +99,8 @@ export async function fetchStockItems(
   const collection = tree?.ENVELOPE?.BODY?.DATA?.COLLECTION ?? tree?.ENVELOPE?.BODY?.DATA ?? {};
   return asArray(collection?.STOCKITEM).map((row: any) => ({
     guid: s(row?.GUID),
-    name: s(row?.["@_NAME"] ?? row?.NAME),
-    alias: s(row?.ALIAS) || null,
+    name: text(row?.["@_NAME"] ?? row?.NAME),
+    alias: text(row?.ALIAS) || null,
     alterId: n(row?.ALTERID),
     // ClosingBalance arrives as e.g. "42 Nos" — strip the unit.
     closingStockQty: n(String(s(row?.CLOSINGBALANCE)).replace(/[^\d.-]/g, "")),
@@ -220,15 +220,15 @@ export async function fetchLedgers(
     const gstReg = latestDated(row?.["LEDGSTREGDETAILS.LIST"]);
     const addressSource = mailing?.["ADDRESS.LIST"] ?? row?.["ADDRESS.LIST"];
     const addressLines = asArray(addressSource?.ADDRESS ?? row?.ADDRESS)
-      .map((a: unknown) => s(a))
+      .map((a: unknown) => text(a))
       .filter(Boolean);
     return {
       guid: s(row?.GUID),
       alterId: n(row?.ALTERID),
-      ledgerName: s(row?.["@_NAME"] ?? row?.NAME),
+      ledgerName: text(row?.["@_NAME"] ?? row?.NAME),
       gstin: s(gstReg?.GSTIN) || s(row?.PARTYGSTIN) || null,
       addressLine: addressLines.join(", ") || null,
-      city: s(mailing?.CITY) || null,
+      city: text(mailing?.CITY) || null,
       state: s(mailing?.STATE) || s(row?.LEDSTATENAME) || null,
       pincode: s(mailing?.PINCODE) || s(row?.PINCODE) || null,
       mobile: s(row?.LEDGERPHONE) || null,

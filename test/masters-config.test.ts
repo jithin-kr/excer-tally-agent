@@ -120,3 +120,33 @@ test("base price is the SET standard selling price — never cost, never the las
   assert.equal(byName.Priced.baseRate, 60); // latest dated entry
   assert.equal(byName.Unpriced.baseRate, null);
 });
+
+test("line breaks Tally keeps in names and addresses are decoded and tidied (live TallyPrime)", async () => {
+  const { client } = fakeClient((xml) =>
+    xml.includes("StockItem")
+      ? collection(
+          `<STOCKITEM NAME="Twisted Wire Aluminum - 40 X 76 - Drum&#13;&#10;&#13;&#10;">` +
+            `<GUID TYPE="String">g-cr</GUID><ALTERID TYPE="Number"> 5</ALTERID></STOCKITEM>`
+        )
+      : collection(
+          `<LEDGER NAME="A &amp; B Traders"><GUID TYPE="String">g-l</GUID><ALTERID TYPE="Number"> 6</ALTERID>` +
+            `<LEDMAILINGDETAILS.LIST><ADDRESS.LIST TYPE="String"><ADDRESS>SBM 10/110, Kavungal Building, &#10;Near Pipe House</ADDRESS></ADDRESS.LIST>` +
+            `<APPLICABLEFROM>20260401</APPLICABLEFROM><STATE>Kerala</STATE></LEDMAILINGDETAILS.LIST></LEDGER>`
+        )
+  );
+  const [item] = await fetchStockItems(client, 0, "Test Co");
+  assert.equal(item.name, "Twisted Wire Aluminum - 40 X 76 - Drum");
+  const [row] = await fetchLedgers(client, 0, "Test Co");
+  assert.equal(row.ledgerName, "A & B Traders");
+  assert.equal(row.addressLine, "SBM 10/110, Kavungal Building, Near Pipe House");
+});
+
+test("a large export with thousands of escaped characters still parses (live company tripped the cap)", async () => {
+  const rows = Array.from({ length: 1200 }, (_, i) =>
+    `<STOCKITEM NAME="Item ${i} &amp; Co&#13;&#10;"><GUID TYPE="String">g-${i}</GUID><ALTERID TYPE="Number"> ${i + 1}</ALTERID></STOCKITEM>`
+  ).join("");
+  const { client } = fakeClient(() => collection(rows));
+  const items = await fetchStockItems(client, 0, "Test Co");
+  assert.equal(items.length, 1200);
+  assert.equal(items[1199].name, "Item 1199 & Co");
+});

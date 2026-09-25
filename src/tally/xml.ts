@@ -166,7 +166,19 @@ export function buildImportEnvelope(opts: ImportOptions): string {
 /*  Response parsing                                                          */
 /* -------------------------------------------------------------------------- */
 
+// EXCER: htmlEntities decodes numeric references too. Tally writes a line break typed into a
+// name or address as "&#13;&#10;", which otherwise reached the website verbatim ("Drum&#13;&#10;"
+// on a live TallyPrime, 2026-09-25). Values are trimmed before decoding, so see text() in util.ts.
+//
+// By default the parser also stops after decoding 1000 references in one response, counting every
+// "&amp;" too; one export of the live company's masters went past that and failed outright. The cap
+// guards against DOCTYPE entity bombs. Tally sends no DOCTYPE, and only from localhost, so the total
+// is lifted; the library's per-entity DOCTYPE limits stay at their defaults.
+const ENTITY_OPTIONS = { enabled: true, maxTotalExpansions: Infinity };
+
 const parser = new XMLParser({
+  htmlEntities: true,
+  processEntities: ENTITY_OPTIONS,
   ignoreAttributes: false,
   attributeNamePrefix: "@_",
   allowBooleanAttributes: true,
@@ -184,6 +196,8 @@ export function parseTallyXml(xml: string): any {
 // voucher numbered "0012" must be cancelled as "0012". Use this one when reading ids and numbers
 // that are really strings.
 const stringParser = new XMLParser({
+  htmlEntities: true,
+  processEntities: ENTITY_OPTIONS,
   ignoreAttributes: false,
   attributeNamePrefix: "@_",
   allowBooleanAttributes: true,

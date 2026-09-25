@@ -27,6 +27,7 @@ export function agentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     pollIntervalMs: 15_000,
     heartbeatIntervalMs: 30_000,
     stockRefreshMinIntervalMs: 60_000,
+    appTimeoutMs: 15_000,
     stateFile: "unused",
     agentId: "test-agent",
     postVouchersAsOptional: true,

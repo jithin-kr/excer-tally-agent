@@ -23,9 +23,6 @@ import { fetchLedgers, fetchStockItems, getLastAlterIds } from "./excer/masters.
 import { errorMessage, log } from "./log.js";
 import { saveWatermarks, type Watermarks } from "./state-store.js";
 
-/** How long a call back into the Excer app may take before we give up on it this tick. */
-const APP_TIMEOUT_MS = 15_000;
-
 export interface PollState extends Watermarks {
   lastRunAt: string | null;
   lastError: string | null;
@@ -58,7 +55,7 @@ export async function postToApp(config: AgentConfig, path: string, body: unknown
     body: JSON.stringify(body),
     // Without a timeout, one hung request to Vercel would stall this loop forever: the next tick
     // is only scheduled once the current one finishes.
-    signal: AbortSignal.timeout(APP_TIMEOUT_MS),
+    signal: AbortSignal.timeout(config.appTimeoutMs),
   });
   if (!res.ok) {
     throw new Error(`Excer app returned HTTP ${res.status} for ${path}`);

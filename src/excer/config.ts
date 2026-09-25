@@ -48,6 +48,11 @@ export interface AgentConfig {
    * re-reads every item's closing balance, so on a busy day this caps how often we ask for it.
    */
   stockRefreshMinIntervalMs: number;
+  /**
+   * How long a call back into the Excer app may take before we give up on it this tick (ms). The
+   * first sync of a real company sends every master at once and can outlast the 15s default.
+   */
+  appTimeoutMs: number;
   /** Where the poll watermarks are persisted across restarts. */
   stateFile: string;
   /** Stable id for this agent instance. */
@@ -112,6 +117,7 @@ export function loadAgentConfig(): AgentConfig {
     pollIntervalMs: int("POLL_INTERVAL_MS", 15_000),
     heartbeatIntervalMs: int("HEARTBEAT_INTERVAL_MS", 30_000),
     stockRefreshMinIntervalMs: int("STOCK_REFRESH_MIN_INTERVAL_MS", 60_000),
+    appTimeoutMs: int("APP_TIMEOUT_MS", 15_000),
     // Relative to the working directory, which the installer sets to the repo root.
     stateFile: resolve(process.env.AGENT_STATE_FILE?.trim() || "state/poll-state.json"),
     agentId: process.env.AGENT_ID?.trim() || "excer-tally-agent-1",

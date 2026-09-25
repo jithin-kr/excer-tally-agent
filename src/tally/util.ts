@@ -23,6 +23,16 @@ export function s(v: unknown): string {
   return String(v);
 }
 
+/**
+ * EXCER: a value shown to people (a name, an address line) as one tidy line. Tally keeps line
+ * breaks typed into a name, and the parser trims before it decodes them, so "Drum&#13;&#10;"
+ * came through as a name ending in line breaks. Not for identifiers: those must match Tally
+ * byte for byte.
+ */
+export function text(v: unknown): string {
+  return s(v).replace(/\s+/g, " ").trim();
+}
+
 /** Coerce to number, handling Tally's empty / whitespace cases. */
 export function n(v: unknown): number {
   v = unwrap(v);
