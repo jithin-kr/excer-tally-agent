@@ -90,6 +90,7 @@ export async function fetchStockItems(
         <FETCH>HSNDetails</FETCH>
         <FETCH>StandardPriceList</FETCH>
         <FETCH>IsDeleted</FETCH>
+        <FETCH>Parent</FETCH>
         ${filterTag}
       </COLLECTION>
       ${systemTag}`,
@@ -97,7 +98,10 @@ export async function fetchStockItems(
 
   const tree = parseTallyXmlAsStrings(await client.send(xml));
   const collection = tree?.ENVELOPE?.BODY?.DATA?.COLLECTION ?? tree?.ENVELOPE?.BODY?.DATA ?? {};
-  return asArray(collection?.STOCKITEM).map((row: any) => ({
+  const rows = asArray(collection?.STOCKITEM);
+  // Only asked for when there are items to file: groups are few, but every request queues on Tally.
+  const groupPath = rows.length > 0 ? await fetchStockGroupPaths(client, company) : () => [];
+  return rows.map((row: any) => ({
     guid: s(row?.GUID),
     name: text(row?.["@_NAME"] ?? row?.NAME),
     alias: text(row?.ALIAS) || null,
@@ -114,7 +118,44 @@ export async function fetchStockItems(
     //   $StandardPrice  = computed; with no list set it falls back to the LAST SALE's rate
     baseRate: rateOrNull(latestByDate(row?.["STANDARDPRICELIST.LIST"])?.RATE),
     active: s(row?.ISDELETED).toLowerCase() !== "yes",
+    stockGroupPath: groupPath(text(row?.PARENT)),
   }));
+}
+
+/**
+ * Resolves a stock group name to its path from the top-level group down ("AC Cable" →
+ * ["Cable", "AC Cable"]). Tally's root is "Primary", sent as "&#4; Primary" — a name that is not
+ * itself a group ends the walk, so the root never appears in a path.
+ */
+async function fetchStockGroupPaths(
+  client: TallyClient,
+  company?: string
+): Promise<(group: string) => string[]> {
+  const xml = buildExportCollectionEnvelope({
+    collectionName: "ExcerStockGroups",
+    staticVariables: { company },
+    tdlMessage: `
+      <COLLECTION NAME="ExcerStockGroups" ISMODIFY="No">
+        <TYPE>StockGroup</TYPE>
+        <FETCH>Name</FETCH>
+        <FETCH>Parent</FETCH>
+      </COLLECTION>`,
+  });
+  const tree = parseTallyXmlAsStrings(await client.send(xml));
+  const collection = tree?.ENVELOPE?.BODY?.DATA?.COLLECTION ?? tree?.ENVELOPE?.BODY?.DATA ?? {};
+  const parentOf = new Map<string, string>();
+  for (const row of asArray(collection?.STOCKGROUP) as any[]) {
+    const name = text(row?.["@_NAME"] ?? row?.NAME);
+    if (name) parentOf.set(name, text(row?.PARENT));
+  }
+  return (group) => {
+    const path: string[] = [];
+    // The depth cap only guards against a malformed (cyclic) answer; real trees are shallow.
+    for (let g = group; parentOf.has(g) && path.length < 20; g = parentOf.get(g) ?? "") {
+      path.unshift(g);
+    }
+    return path;
+  };
 }
 
 /** The latest entry of a list dated by <DATE> (e.g. STANDARDPRICELIST.LIST), or null. */

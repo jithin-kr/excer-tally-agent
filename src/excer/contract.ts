@@ -27,6 +27,11 @@ export interface TallyStockItemRow {
   /** Standard selling price, ex-GST; null when none is set in Tally. */
   baseRate: number | null;
   active: boolean;
+  /**
+   * The item's Tally stock group, top-level group first: ["Cable", "AC Cable"]. Empty when the
+   * item sits directly under Tally's root ("Primary"). The website files the item by it.
+   */
+  stockGroupPath?: string[];
 }
 
 export interface TallyLedgerRow {

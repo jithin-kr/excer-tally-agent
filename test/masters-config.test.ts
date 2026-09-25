@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fetchLedgers, fetchStockItems } from "../src/excer/masters.js";
 import { loadAgentConfig } from "../src/excer/config.js";
-import { collection, fakeClient } from "./helpers.js";
+import { collection, collectionId, fakeClient } from "./helpers.js";
 
 test("stock item names come through exactly — '007' is not turned into 7", async () => {
   const { client } = fakeClient(() =>
@@ -149,4 +149,26 @@ test("a large export with thousands of escaped characters still parses (live com
   const items = await fetchStockItems(client, 0, "Test Co");
   assert.equal(items.length, 1200);
   assert.equal(items[1199].name, "Item 1199 & Co");
+});
+
+test("each stock item carries its stock-group path, top level first, without Tally's root", async () => {
+  const { client } = fakeClient((xml) =>
+    collectionId(xml) === "ExcerStockGroups"
+      ? collection(
+          // Shapes from the client's live company: the root arrives as "&#4; Primary".
+          `<STOCKGROUP NAME="Cable"><PARENT TYPE="String">&#4; Primary</PARENT></STOCKGROUP>` +
+            `<STOCKGROUP NAME="AC Cable"><PARENT TYPE="String">Cable</PARENT></STOCKGROUP>` +
+            `<STOCKGROUP NAME="Solar Accessories"><PARENT TYPE="String">&#4; Primary</PARENT></STOCKGROUP>`
+        )
+      : collection(
+          `<STOCKITEM NAME="4 Sqmm AC"><GUID>g-1</GUID><PARENT TYPE="String">AC Cable</PARENT></STOCKITEM>` +
+            `<STOCKITEM NAME="MC4 Connector"><GUID>g-2</GUID><PARENT TYPE="String">Solar Accessories</PARENT></STOCKITEM>` +
+            `<STOCKITEM NAME="Loose Item"><GUID>g-3</GUID><PARENT TYPE="String">&#4; Primary</PARENT></STOCKITEM>`
+        )
+  );
+  const items = await fetchStockItems(client, 0, "Test Co");
+  assert.deepEqual(
+    items.map((i) => i.stockGroupPath),
+    [["Cable", "AC Cable"], ["Solar Accessories"], []]
+  );
 });
