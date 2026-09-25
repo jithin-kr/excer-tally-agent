@@ -53,6 +53,21 @@ export interface TallyLedgerRow {
   active: boolean;
 }
 
+/** One party's outstanding, as Tally's Outstandings report shows it (read live, never stored). */
+export interface TallyOutstandingRow {
+  guid: string;
+  name: string;
+  /** The ledger's own group: Excer keeps parties in sub-groups of Sundry Debtors per salesman. */
+  group: string;
+  /** Closing balance: positive = Dr (the party owes us), negative = Cr (an advance). */
+  balance: number;
+}
+
+export interface OutstandingsResponse {
+  parties: TallyOutstandingRow[];
+  asOf: string;
+}
+
 export interface MastersResponse {
   stockItems: TallyStockItemRow[];
   ledgers: TallyLedgerRow[];

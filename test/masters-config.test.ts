@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fetchLedgers, fetchStockItems } from "../src/excer/masters.js";
+import { fetchLedgers, fetchOutstandings, fetchStockItems } from "../src/excer/masters.js";
 import { loadAgentConfig } from "../src/excer/config.js";
 import { collection, collectionId, fakeClient } from "./helpers.js";
 
@@ -191,4 +191,23 @@ test("closing rate and value come through as Tally's Stock Summary shows them", 
   assert.equal(item.closingValue, 52082.99);
   assert.equal(empty.closingRate, null);
   assert.equal(empty.closingValue, null);
+});
+
+test("outstandings: Dr reads positive, Cr negative, zero balances left out (live shapes)", async () => {
+  const { client, requests } = fakeClient(() =>
+    collection(
+      `<LEDGER NAME="3 Dot Power Solutions"><GUID TYPE="String">g-1</GUID><PARENT TYPE="String">Solar - Rasmy</PARENT>` +
+        `<CLOSINGBALANCE TYPE="Amount">-19812.00</CLOSINGBALANCE></LEDGER>` +
+        `<LEDGER NAME="Advance Party"><GUID TYPE="String">g-2</GUID><PARENT TYPE="String">Sundry Debtors</PARENT>` +
+        `<CLOSINGBALANCE TYPE="Amount">5000.00</CLOSINGBALANCE></LEDGER>` +
+        `<LEDGER NAME="Settled"><GUID TYPE="String">g-3</GUID><CLOSINGBALANCE TYPE="Amount"></CLOSINGBALANCE></LEDGER>`
+    )
+  );
+  const rows = await fetchOutstandings(client, "Test Co");
+  assert.deepEqual(rows, [
+    { guid: "g-1", name: "3 Dot Power Solutions", group: "Solar - Rasmy", balance: 19812 },
+    { guid: "g-2", name: "Advance Party", group: "Sundry Debtors", balance: -5000 },
+  ]);
+  // Sub-group parties are included: the filter is $$IsBelongsTo, not $Parent =.
+  assert.match(requests[0], /\$\$IsBelongsTo:"Sundry Debtors"/);
 });

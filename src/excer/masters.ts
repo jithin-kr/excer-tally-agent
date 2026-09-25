@@ -17,7 +17,7 @@
 import type { TallyClient } from "../tally/client.js";
 import { buildExportCollectionEnvelope, escapeXml, parseTallyXmlAsStrings } from "../tally/xml.js";
 import { asArray, n, s, text } from "../tally/util.js";
-import type { TallyLedgerRow, TallyStockItemRow } from "./contract.js";
+import type { TallyLedgerRow, TallyOutstandingRow, TallyStockItemRow } from "./contract.js";
 
 /* -------------------------------------------------------------------------- */
 /*  Stage 1 — the cheap "has anything changed?" counter                        */
@@ -292,4 +292,44 @@ export async function fetchLedgers(
       active: s(row?.ISDELETED).toLowerCase() !== "yes",
     };
   });
+}
+
+/**
+ * Every customer ledger with a balance, for the website's live Outstandings report (§46 in the
+ * app's CLAUDE.md). Balances move with vouchers, not AlterIDs, so this is read on demand instead of
+ * synced. Tally exports a debit as negative (-19812.00 = the party owes ₹19,812, verified live);
+ * flipped so Dr reads positive. Zero balances are left out.
+ */
+export async function fetchOutstandings(
+  client: TallyClient,
+  company?: string,
+  parentGroup = "Sundry Debtors"
+): Promise<TallyOutstandingRow[]> {
+  const xml = buildExportCollectionEnvelope({
+    collectionName: "ExcerOutstandings",
+    staticVariables: { company },
+    tdlMessage: `
+      <COLLECTION NAME="ExcerOutstandings" ISMODIFY="No">
+        <TYPE>Ledger</TYPE>
+        <FETCH>GUID</FETCH>
+        <FETCH>Name</FETCH>
+        <FETCH>Parent</FETCH>
+        <FETCH>ClosingBalance</FETCH>
+        <FILTER>ExcerOutstandingGroup</FILTER>
+      </COLLECTION>
+      <SYSTEM TYPE="Formulae" NAME="ExcerOutstandingGroup">$$IsBelongsTo:"${escapeXml(parentGroup)}"</SYSTEM>`,
+  });
+  const tree = parseTallyXmlAsStrings(await client.send(xml));
+  const collection = tree?.ENVELOPE?.BODY?.DATA?.COLLECTION ?? tree?.ENVELOPE?.BODY?.DATA ?? {};
+  return asArray(collection?.LEDGER)
+    .map((row: any) => {
+      const raw = s(row?.CLOSINGBALANCE).replace(/[^\d.-]/g, "");
+      return {
+        guid: s(row?.GUID),
+        name: text(row?.["@_NAME"] ?? row?.NAME),
+        group: text(row?.PARENT) || parentGroup,
+        balance: raw === "" ? 0 : -n(raw) || 0,
+      };
+    })
+    .filter((r: TallyOutstandingRow) => r.balance !== 0);
 }

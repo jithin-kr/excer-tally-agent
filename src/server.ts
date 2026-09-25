@@ -13,12 +13,13 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AgentConfig } from "./excer/config.js";
 import type { TallyClient } from "./tally/client.js";
 import { buildVoucherXml, voucherDate } from "./excer/vouchers.js";
-import { fetchLedgers, fetchStockItems } from "./excer/masters.js";
+import { fetchLedgers, fetchOutstandings, fetchStockItems } from "./excer/masters.js";
 import { findLedgerByName, findVoucherByRemoteId, type VoucherIdentity } from "./excer/lookup.js";
 import { parseImportResult } from "./tally/xml.js";
 import {
   pushRequestSchema,
   type MastersResponse,
+  type OutstandingsResponse,
   type PushRequest,
   type PushResponse,
 } from "./excer/contract.js";
@@ -279,6 +280,17 @@ export function createAgentServer(config: AgentConfig, client: TallyClient, poll
         );
         state.lastPullAt = new Date().toISOString();
         const body: MastersResponse = { stockItems, ledgers, maxAlterId };
+        return json(res, 200, body);
+      } catch (err) {
+        return json(res, 502, { error: errorMessage(err) });
+      }
+    }
+
+    // ── Read: party outstandings, live (the website's Outstandings report) ─
+    if (req.method === "GET" && url.pathname === "/api/export/outstandings") {
+      try {
+        const parties = await fetchOutstandings(client, company, config.tallyNames.customerParentGroup);
+        const body: OutstandingsResponse = { parties, asOf: new Date().toISOString() };
         return json(res, 200, body);
       } catch (err) {
         return json(res, 502, { error: errorMessage(err) });

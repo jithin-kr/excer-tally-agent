@@ -94,6 +94,7 @@ bodies are specified in [docs/design.md](docs/design.md).
 |---|---|---|---|
 | `GET` | `/health` | none / `x-api-key` | Liveness. Without the key: `{ ok, agentId, tallyReachable }` only (it is public through the tunnel). With the key: company, last poll, last error, watermarks. Never queries Tally itself — it reports the poll loop's last result |
 | `GET` | `/api/export/masters?sinceAlterId=N` | `x-api-key` | Stock items + customer ledgers |
+| `GET` | `/api/export/outstandings` | `x-api-key` | Every Sundry Debtor with a balance, live (Dr positive), for the website's Outstandings report |
 | `POST` | `/api/import/voucher` | `x-api-key` | Post one of the six voucher types |
 
 ### Idempotency
