@@ -31,6 +31,7 @@ export function agentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     stateFile: "unused",
     agentId: "test-agent",
     postVouchersAsOptional: true,
+    postDeliveryNotesAsOptional: false,
     tallyNames: names,
     ...overrides,
   };

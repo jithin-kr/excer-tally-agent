@@ -61,6 +61,8 @@ changes back, through a Cloudflare Tunnel so nothing is exposed. See [prd.md](pr
 
 | Date | Decision |
 |---|---|
+| 2026-09-26 | Agent is installed as a service on the client's Tally PC |
+| 2026-09-26 | **Tally owns stock.** Website sales lower it through a Delivery Note at dispatch, posted **Regular** (`TALLY_POST_DELIVERY_NOTES_AS_OPTIONAL=false`), without waiting for the Sales Order; the website stops deducting Tally items and holds dispatched quantities until the pull brings Tally's new stock back |
 | 2026-09-24 | Tally items appear on the website as hidden drafts; admin adds images/details and publishes; Tally can hide, never publish |
 | 2026-09-24 | Cancel by REMOTEID, never by voucher number (Optional vouchers share numbers) |
 | 2026-09-24 | Look up REMOTEID **before** writing; re-imports alter existing vouchers |
@@ -103,7 +105,7 @@ changes back, through a Cloudflare Tunnel so nothing is exposed. See [prd.md](pr
 ## 7. Open items
 
 1. **Sales Order** is rejected (`Bad Order Number in Voucher!`) in every layout tried. Next step:
-   enter one by hand in Tally (Ctrl+F8), export it, copy the structure.
-2. Client questions: permission to install a service; stock ownership (website vs Tally).
+   enter one by hand in Tally (Alt+F5), export it, copy the structure.
+2. ~~Client questions~~ answered 2026-09-26: the service is allowed; Tally owns stock (§5).
 3. The client's real voucher-type/ledger/group names for `.env`.
 4. Whether the client sets GST/HSN per item or per stock group (group → `gstRate` null).

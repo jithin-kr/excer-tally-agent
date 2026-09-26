@@ -7,6 +7,7 @@
 // hard-code a Tally voucher type or ledger name.
 
 import { resolve } from "node:path";
+import type { TallyJobType } from "./contract.js";
 
 export interface TallyNames {
   /** Voucher type names EXACTLY as configured in their Tally. §20.6 Q15. */
@@ -66,7 +67,19 @@ export interface AgentConfig {
    * proven reliable against a real Tally test company (§22.6).
    */
   postVouchersAsOptional: boolean;
+  /**
+   * Delivery Notes are the exception: Tally owns stock (decided 2026-09-26), and a website sale
+   * lowers Tally's stock only through its Delivery Note. An Optional voucher moves no stock until
+   * an accountant converts it, so Delivery Notes post Regular by default. The accountant can
+   * still alter or delete one in Tally.
+   */
+  postDeliveryNotesAsOptional: boolean;
   tallyNames: TallyNames;
+}
+
+/** Whether a push of this type goes into Tally's Optional register. */
+export function postsAsOptional(type: TallyJobType, config: AgentConfig): boolean {
+  return type === "push_delivery_note" ? config.postDeliveryNotesAsOptional : config.postVouchersAsOptional;
 }
 
 function required(name: string): string {
@@ -122,6 +135,7 @@ export function loadAgentConfig(): AgentConfig {
     stateFile: resolve(process.env.AGENT_STATE_FILE?.trim() || "state/poll-state.json"),
     agentId: process.env.AGENT_ID?.trim() || "excer-tally-agent-1",
     postVouchersAsOptional: bool("TALLY_POST_VOUCHERS_AS_OPTIONAL", true),
+    postDeliveryNotesAsOptional: bool("TALLY_POST_DELIVERY_NOTES_AS_OPTIONAL", false),
     tallyNames: {
       salesOrderVoucherType: process.env.TALLY_VT_SALES_ORDER?.trim() || "Sales Order",
       deliveryNoteVoucherType: process.env.TALLY_VT_DELIVERY_NOTE?.trim() || "Delivery Note",

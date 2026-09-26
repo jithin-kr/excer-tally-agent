@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fetchLedgers, fetchOutstandings, fetchStockItems } from "../src/excer/masters.js";
-import { loadAgentConfig } from "../src/excer/config.js";
-import { collection, collectionId, fakeClient } from "./helpers.js";
+import { loadAgentConfig, postsAsOptional } from "../src/excer/config.js";
+import { agentConfig, collection, collectionId, fakeClient } from "./helpers.js";
 
 test("stock item names come through exactly — '007' is not turned into 7", async () => {
   const { client } = fakeClient(() =>
@@ -210,4 +210,15 @@ test("outstandings: Dr reads positive, Cr negative, zero balances left out (live
   ]);
   // Sub-group parties are included: the filter is $$IsBelongsTo, not $Parent =.
   assert.match(requests[0], /\$\$IsBelongsTo:"Sundry Debtors"/);
+});
+
+test("config: Delivery Notes post Regular (they move Tally's stock); other vouchers stay Optional", () => {
+  withEnv({ AGENT_API_KEY: "a-long-enough-random-secret" }, () => {
+    const config = loadAgentConfig();
+    assert.equal(postsAsOptional("push_delivery_note", config), false);
+    assert.equal(postsAsOptional("push_sales_order", config), true);
+    assert.equal(postsAsOptional("push_credit_note", config), true);
+  });
+  const allOptional = agentConfig({ postDeliveryNotesAsOptional: true });
+  assert.equal(postsAsOptional("push_delivery_note", allOptional), true);
 });

@@ -10,7 +10,7 @@
 
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import type { AgentConfig } from "./excer/config.js";
+import { postsAsOptional, type AgentConfig } from "./excer/config.js";
 import type { TallyClient } from "./tally/client.js";
 import { buildVoucherXml, voucherDate } from "./excer/vouchers.js";
 import { fetchLedgers, fetchOutstandings, fetchStockItems } from "./excer/masters.js";
@@ -159,7 +159,7 @@ export function createAgentServer(config: AgentConfig, client: TallyClient, poll
     }
 
     // ── 2. Write. ─────────────────────────────────────────────────────────
-    const xml = buildVoucherXml(req, config.tallyNames, company, config.postVouchersAsOptional);
+    const xml = buildVoucherXml(req, config.tallyNames, company, postsAsOptional(req.type, config));
     const result = parseImportResult(await client.send(xml));
 
     if (looksLikeDuplicate(result)) {

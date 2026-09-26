@@ -233,15 +233,18 @@ Post your first voucher into a **test company**, never the live one.
 
 ---
 
-## Still blocked on the client
+## Client decisions — 2026-09-26
 
-Neither is a code problem, and both outrank everything above:
-
-1. **May we install a Windows Service on the Tally machine?** If not, this whole approach needs
-   rethinking. Find out first.
-2. **Who owns stock — Tally, the app, or both reconciled?** (CLAUDE.md §20.5, options A/B/C.)
-   Today the app deducts stock on dispatch. Once we also post Delivery Notes, both systems deduct
-   the same goods unless this is decided deliberately.
+1. **The agent is installed as a Windows service on the client's Tally PC.**
+2. **Tally owns stock** (CLAUDE.md §20.5, option A). A website sale lowers Tally's stock through
+   its **Delivery Note, posted at dispatch**:
+   - Delivery Notes post **Regular**, not Optional (`TALLY_POST_DELIVERY_NOTES_AS_OPTIONAL=false`),
+     because an Optional voucher moves no stock until an accountant converts it. Every other
+     voucher type still follows `TALLY_POST_VOUCHERS_AS_OPTIONAL`.
+   - A Delivery Note no longer waits for the order's Sales Order to land, so stock works while
+     Sales Orders are still rejected.
+   - The website no longer deducts Tally items at dispatch. It holds a dispatched order's quantity
+     until the pull brings Tally's lower number back, then shows Tally's stock.
 
 ---
 

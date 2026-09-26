@@ -96,8 +96,8 @@ Verified on a live TallyPrime Edit Log test company on 2026-09-24 (details in th
 ## 6. Open
 
 1. **Sales Order voucher layout.** Needs one Sales Order entered by hand in Tally to copy.
-2. **Client questions** (outrank everything): may we install a service on the Tally PC; and who
-   owns stock when the website and Tally disagree.
+2. ~~**Client questions**~~ answered 2026-09-26: the agent is installed as a service on the
+   client's Tally PC, and **Tally owns stock** (see the README).
 3. **The client's real Tally names**: voucher types, ledgers, customer group (`.env`).
 4. **Cable cuts** are recorded stock-neutral; confirm the business does not want them to consume
    stock.
