@@ -84,6 +84,37 @@ test("both counters 0: refuses to poll rather than full-export every tick", asyn
   assert.equal(requests.length, 1);
 });
 
+test("company not open (Tally at its login screen): unreachable, with a plain reason — not a field-name hint", async () => {
+  // Verified live: at the login screen Tally lists no open company, so every query answers empty.
+  const { client } = fakeClient(() => collection(""));
+  const state = createPollState({ lastMasterAlterId: 5, lastVoucherAlterId: 7 });
+  await assert.rejects(pollOnce(agentConfig({ stateFile: join(dir, "s.json") }), client, state), /is not open/);
+  assert.equal(state.tallyReachable, false);
+  assert.equal(state.lastMasterAlterId, 5); // nothing skipped: sync resumes where it left off
+});
+
+test("several companies open: the counters are the configured company's, not the first row's", async () => {
+  const { client } = fakeClient((xml) =>
+    collectionId(xml) === "ExcerAlterIds"
+      ? collection(
+          `<COMPANY NAME="Other Co"><ALTMSTID>999</ALTMSTID><ALTVCHID>999</ALTVCHID></COMPANY>` +
+            `<COMPANY NAME="Test Co"><ALTMSTID>5</ALTMSTID><ALTVCHID>7</ALTVCHID></COMPANY>`
+        )
+      : collection("")
+  );
+  const state = createPollState({ lastMasterAlterId: 5, lastVoucherAlterId: 7 });
+  assert.equal(await pollOnce(agentConfig({ stateFile: join(dir, "s.json") }), client, state), false); // unchanged
+  assert.equal(state.tallyReachable, true);
+});
+
+test("configured company closed while another is open: not open, not the other company's counters", async () => {
+  const { client } = fakeClient(() =>
+    collection(`<COMPANY NAME="Other Co"><ALTMSTID>999</ALTMSTID><ALTVCHID>999</ALTVCHID></COMPANY>`)
+  );
+  const state = createPollState({ lastMasterAlterId: 5, lastVoucherAlterId: 7 });
+  await assert.rejects(pollOnce(agentConfig({ stateFile: join(dir, "s.json") }), client, state), /"Test Co" is not open/);
+});
+
 test("no app URL: watermarks do not advance, so nothing is skipped later", async () => {
   const { client } = tally(10, 21);
   const state = createPollState({ lastMasterAlterId: 1, lastVoucherAlterId: 1 });

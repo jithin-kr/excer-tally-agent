@@ -29,6 +29,51 @@ export interface TallyNames {
   godown?: string;
   /** Home state — used to decide CGST+SGST vs IGST. */
   homeState: string;
+  /**
+   * Ledgers per GST rate, keyed by the item's total rate ("5", "12", "18"). Many books keep one
+   * sales ledger and one set of tax ledgers per rate instead of a single one — the client's does
+   * ("Sales@18%", "CGST@9%", "SGST@9%", "IGST @18%"; verified 2026-09-26). A line whose rate is
+   * listed posts to these; any other line, or a blank entry, uses the single ledgers above.
+   */
+  ledgersByRate?: Record<string, RateLedgers>;
+}
+
+/** The ledgers one GST rate posts to. A missing one falls back to the single ledger of its kind. */
+export interface RateLedgers {
+  sales?: string;
+  cgst?: string;
+  sgst?: string;
+  igst?: string;
+}
+
+/** The key `ledgersByRate` uses for a rate: 18 and "18.00" are the same rate. */
+export function rateKey(rate: number): string {
+  return String(Number(rate));
+}
+
+/**
+ * Parses TALLY_LEDGERS_BY_RATE: `rate=sales|cgst|sgst|igst`, one rate per `;`. A blank position
+ * keeps the single ledger of that kind. Example (the client's books):
+ *   18=Sales@18%|CGST@9%|SGST@9%|IGST @18%; 12=Sales@12%|CGST @6%|SGST @6%|IGST 12%
+ * Ledger names are used exactly as written after trimming the ends, spaces inside and all.
+ */
+export function parseLedgersByRate(raw: string | undefined): Record<string, RateLedgers> | undefined {
+  if (!raw?.trim()) return undefined;
+  const map: Record<string, RateLedgers> = {};
+  for (const entry of raw.split(";").map((e) => e.trim()).filter(Boolean)) {
+    const eq = entry.indexOf("=");
+    const rate = Number(eq > 0 ? entry.slice(0, eq).trim() : NaN);
+    const parts = eq > 0 ? entry.slice(eq + 1).split("|").map((p) => p.trim()) : [];
+    if (!Number.isFinite(rate) || rate < 0 || parts.length !== 4) {
+      throw new Error(
+        `Invalid TALLY_LEDGERS_BY_RATE entry "${entry}". Expected rate=sales|cgst|sgst|igst, ` +
+          `e.g. 18=Sales@18%|CGST@9%|SGST@9%|IGST @18% (leave a position blank to keep the default).`
+      );
+    }
+    const [sales, cgst, sgst, igst] = parts.map((p) => p || undefined);
+    map[rateKey(rate)] = { sales, cgst, sgst, igst };
+  }
+  return map;
 }
 
 export interface AgentConfig {
@@ -136,19 +181,25 @@ export function loadAgentConfig(): AgentConfig {
     agentId: process.env.AGENT_ID?.trim() || "excer-tally-agent-1",
     postVouchersAsOptional: bool("TALLY_POST_VOUCHERS_AS_OPTIONAL", true),
     postDeliveryNotesAsOptional: bool("TALLY_POST_DELIVERY_NOTES_AS_OPTIONAL", false),
-    tallyNames: {
-      salesOrderVoucherType: process.env.TALLY_VT_SALES_ORDER?.trim() || "Sales Order",
-      deliveryNoteVoucherType: process.env.TALLY_VT_DELIVERY_NOTE?.trim() || "Delivery Note",
-      creditNoteVoucherType: process.env.TALLY_VT_CREDIT_NOTE?.trim() || "Credit Note",
-      stockJournalVoucherType: process.env.TALLY_VT_STOCK_JOURNAL?.trim() || "Stock Journal",
-      salesLedger: process.env.TALLY_LEDGER_SALES?.trim() || "Sales Accounts",
-      cgstLedger: process.env.TALLY_LEDGER_CGST?.trim() || "CGST",
-      sgstLedger: process.env.TALLY_LEDGER_SGST?.trim() || "SGST",
-      igstLedger: process.env.TALLY_LEDGER_IGST?.trim() || "IGST",
-      discountLedger: process.env.TALLY_LEDGER_DISCOUNT?.trim() || "Discount Allowed",
-      customerParentGroup: process.env.TALLY_GROUP_CUSTOMERS?.trim() || "Sundry Debtors",
-      godown: process.env.TALLY_GODOWN?.trim() || undefined,
-      homeState: process.env.TALLY_HOME_STATE?.trim() || "Kerala",
-    },
+    tallyNames: loadTallyNames(),
+  };
+}
+
+/** The installation-specific Tally names, from the environment (see .env.example). */
+export function loadTallyNames(): TallyNames {
+  return {
+    salesOrderVoucherType: process.env.TALLY_VT_SALES_ORDER?.trim() || "Sales Order",
+    deliveryNoteVoucherType: process.env.TALLY_VT_DELIVERY_NOTE?.trim() || "Delivery Note",
+    creditNoteVoucherType: process.env.TALLY_VT_CREDIT_NOTE?.trim() || "Credit Note",
+    stockJournalVoucherType: process.env.TALLY_VT_STOCK_JOURNAL?.trim() || "Stock Journal",
+    salesLedger: process.env.TALLY_LEDGER_SALES?.trim() || "Sales Accounts",
+    cgstLedger: process.env.TALLY_LEDGER_CGST?.trim() || "CGST",
+    sgstLedger: process.env.TALLY_LEDGER_SGST?.trim() || "SGST",
+    igstLedger: process.env.TALLY_LEDGER_IGST?.trim() || "IGST",
+    discountLedger: process.env.TALLY_LEDGER_DISCOUNT?.trim() || "Discount Allowed",
+    customerParentGroup: process.env.TALLY_GROUP_CUSTOMERS?.trim() || "Sundry Debtors",
+    godown: process.env.TALLY_GODOWN?.trim() || undefined,
+    homeState: process.env.TALLY_HOME_STATE?.trim() || "Kerala",
+    ledgersByRate: parseLedgersByRate(process.env.TALLY_LEDGERS_BY_RATE),
   };
 }

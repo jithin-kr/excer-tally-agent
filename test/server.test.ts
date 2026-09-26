@@ -61,6 +61,8 @@ test("push: new voucher is written, then read back for its REAL voucher number",
     assert.equal(body.success, true);
     assert.equal(body.voucherNumber, "0012"); // not "987" (LASTVCHID), and leading zeros kept
     assert.equal(body.guid, "guid-abc");
+    assert.equal(body.tallyResult.created, 1);
+    assert.equal(body.tallyResult.raw, undefined); // counts only, not Tally's whole XML reply
   } finally {
     await agent.close();
   }
@@ -227,6 +229,40 @@ test("cancel: a live order is cancelled by its REMOTEID (live Tally answers ALTE
     assert.equal(body.success, true);
     const cancelXml = agent.requests.find((x) => collectionId(x) === "Vouchers") ?? "";
     assert.match(cancelXml, /REMOTEID="excer-so-1"[^>]*ACTION="Cancel"/);
+  } finally {
+    await agent.close();
+  }
+});
+
+test("cancel: looks the order up on its own day first — a whole-year scan took 12-20s on real books", async () => {
+  const lookups: string[] = [];
+  const agent = await startAgent((xml) => {
+    if (collectionId(xml) === "Vouchers") return importResult(`<ALTERED>1</ALTERED>`);
+    lookups.push(/<SVFROMDATE[^>]*>(\d+)</.exec(xml)?.[1] ?? "whole year");
+    return collection(voucherRow);
+  });
+  try {
+    const { status } = await agent.push({ ...cancelOrder, salesOrderDate: "2026-09-01" });
+    assert.equal(status, 200);
+    assert.deepEqual(lookups, ["20260901"]); // found on the day: no whole-year scan
+  } finally {
+    await agent.close();
+  }
+});
+
+test("cancel: an order not found on the given day is still found by the whole-year search", async () => {
+  const lookups: string[] = [];
+  const agent = await startAgent((xml) => {
+    if (collectionId(xml) === "Vouchers") return importResult(`<ALTERED>1</ALTERED>`);
+    const day = /<SVFROMDATE[^>]*>(\d+)</.exec(xml)?.[1];
+    lookups.push(day ?? "whole year");
+    return collection(day ? "" : voucherRow); // the date was wrong; the order exists
+  });
+  try {
+    const { status, body } = await agent.push({ ...cancelOrder, salesOrderDate: "2026-09-02" });
+    assert.equal(status, 200);
+    assert.equal(body.success, true);
+    assert.deepEqual(lookups, ["20260902", "whole year"]);
   } finally {
     await agent.close();
   }

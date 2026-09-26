@@ -79,12 +79,22 @@ export async function pollOnce(
   let ids;
   try {
     ids = await getLastAlterIds(client, company);
-    state.tallyReachable = true;
   } catch (err) {
     state.tallyReachable = false;
     throw err;
   }
   state.lastRunAt = new Date().toISOString();
+  // Tally answers, but nothing can sync until the company is open. Every morning Tally starts at
+  // the company login screen, where every query answers empty — this used to be reported as
+  // "reachable" with a wrong hint about the counters' field names.
+  if (!ids.companyOpen) {
+    state.tallyReachable = false;
+    throw new Error(
+      `Tally is running, but the company "${company ?? "(active company)"}" is not open — it is ` +
+        `closed, or waiting at its login screen. Sync resumes by itself once it is opened.`
+    );
+  }
+  state.tallyReachable = true;
 
   // Both zero means the ALTMSTID/ALTVCHID field names are wrong on this Tally build (or the company
   // is empty). Carrying on would treat every tick as "changed" and run a FULL export every 15s —

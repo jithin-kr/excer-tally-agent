@@ -55,6 +55,13 @@ export const inventoryEntrySchema = z.object({
   destinationGodown: z.string().optional(),
   /** Sales/Purchase ledger this line allocates to (Invoice mode). */
   accountingLedger: z.string().optional(),
+  /**
+   * EXCER: the order this line belongs to, on an order voucher (Sales Order). Tally files each
+   * line's batch allocation under an order number and due date; without them it rejects the
+   * voucher with "Bad Order Number in Voucher!" (verified against the client's own Sales Orders).
+   */
+  orderNo: z.string().optional(),
+  orderDueDate: z.string().optional(),
   isDeemedPositive: z.boolean().optional(),
   /**
    * EXCER: which list the line goes in. Omitted = ALLINVENTORYENTRIES.LIST (invoices, notes).
@@ -144,6 +151,8 @@ export function renderInventoryEntry(i: InventoryEntry): string {
       <GODOWNNAME>${escapeXml(i.godown ?? "Main Location")}</GODOWNNAME>
       <BATCHNAME>${escapeXml(i.batch ?? "Primary Batch")}</BATCHNAME>
       ${destination}
+      ${i.orderNo ? `<ORDERNO>${escapeXml(i.orderNo)}</ORDERNO>` : ""}
+      ${i.orderDueDate ? `<ORDERDUEDATE>${tallyDate(i.orderDueDate)}</ORDERDUEDATE>` : ""}
       <AMOUNT>${i.amount.toFixed(2)}</AMOUNT>
       <ACTUALQTY>${qty}</ACTUALQTY>
       <BILLEDQTY>${qty}</BILLEDQTY>

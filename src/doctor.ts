@@ -7,7 +7,8 @@
 // Every check prints what it proves, so a failure tells you which assumption was wrong.
 
 import { TallyClient } from "./tally/client.js";
-import { getLastAlterIds, fetchLedgers, fetchStockItems } from "./excer/masters.js";
+import { getLastAlterIds, fetchLedgers, fetchMasterNames, fetchStockItems } from "./excer/masters.js";
+import { loadTallyNames, type TallyNames } from "./excer/config.js";
 import { findLedgerByName, findVoucherByRemoteId } from "./excer/lookup.js";
 import { getGlobalDispatcher } from "undici";
 
@@ -41,6 +42,12 @@ async function main() {
   try {
     const ids = await getLastAlterIds(client, client.config.defaultCompany);
     reachable = true;
+    if (!ids.companyOpen) {
+      console.log(`  FAIL  Tally answers, but the company "${client.config.defaultCompany ?? "(active)"}" is not open.`);
+      console.log("        Open it in Tally (log in if it asks), then run this again. Check TALLY_COMPANY");
+      console.log("        matches the name shown in Tally exactly.");
+      return finish(1);
+    }
     if (ids.masters === 0 && ids.vouchers === 0) {
       // A FAIL, not a warning: the poll loop refuses to run with zero counters (otherwise it
       // would do a full export every 15s), so the agent cannot sync until this is fixed.
@@ -117,9 +124,64 @@ async function main() {
     fail("Ledger lookup by name", err);
   }
 
+  // 5. Does every name in .env exist in THIS company? A wrong one fails every voucher that uses
+  //    it ("Ledger 'Sales Accounts' does not exist!": a group name, found on the client's books).
+  let namesOk = true;
+  try {
+    const missing = await missingTallyNames(client, loadTallyNames());
+    if (missing.length === 0) ok("Configured Tally names exist (voucher types, ledgers, group, godown)");
+    else {
+      namesOk = false;
+      console.log("  FAIL  Configured Tally names missing in this company:");
+      for (const m of missing) console.log(`        ${m}`);
+      console.log(
+        "        Fix them in .env (TALLY_VT_*, TALLY_LEDGER_*, TALLY_LEDGERS_BY_RATE, TALLY_GROUP_CUSTOMERS, TALLY_GODOWN)."
+      );
+    }
+  } catch (err) {
+    namesOk = false;
+    fail("Configured Tally names exist", err);
+  }
+
   console.log("\nRead path checked. Writes are NOT tested here on purpose —");
   console.log("post your first voucher manually into a TEST company, never the live one.\n");
-  await finish(reachable && countersOk ? 0 : 1);
+  await finish(reachable && countersOk && namesOk ? 0 : 1);
+}
+
+/** Each configured name that this company does not have, as `SETTING (kind): "name"` lines. */
+async function missingTallyNames(client: TallyClient, names: TallyNames): Promise<string[]> {
+  const company = client.config.defaultCompany;
+  // One after another: Tally serves one request at a time anyway (TallyClient queues them).
+  const voucherTypes = await fetchMasterNames(client, "VoucherType", company);
+  const ledgers = await fetchMasterNames(client, "Ledger", company);
+  const groups = await fetchMasterNames(client, "Group", company);
+  const godowns = names.godown ? await fetchMasterNames(client, "Godown", company) : new Set<string>();
+
+  const want: Array<[setting: string, name: string | undefined, have: Set<string>]> = [
+    ["TALLY_VT_SALES_ORDER (voucher type)", names.salesOrderVoucherType, voucherTypes],
+    ["TALLY_VT_DELIVERY_NOTE (voucher type)", names.deliveryNoteVoucherType, voucherTypes],
+    ["TALLY_VT_CREDIT_NOTE (voucher type)", names.creditNoteVoucherType, voucherTypes],
+    ["TALLY_VT_STOCK_JOURNAL (voucher type)", names.stockJournalVoucherType, voucherTypes],
+    ["TALLY_LEDGER_SALES (ledger)", names.salesLedger, ledgers],
+    ["TALLY_LEDGER_CGST (ledger)", names.cgstLedger, ledgers],
+    ["TALLY_LEDGER_SGST (ledger)", names.sgstLedger, ledgers],
+    ["TALLY_LEDGER_IGST (ledger)", names.igstLedger, ledgers],
+    ["TALLY_LEDGER_DISCOUNT (ledger)", names.discountLedger, ledgers],
+    ["TALLY_GROUP_CUSTOMERS (group)", names.customerParentGroup, groups],
+    ["TALLY_GODOWN (godown)", names.godown, godowns],
+  ];
+  for (const [rate, l] of Object.entries(names.ledgersByRate ?? {})) {
+    for (const kind of ["sales", "cgst", "sgst", "igst"] as const) {
+      want.push([`TALLY_LEDGERS_BY_RATE ${rate}% ${kind} (ledger)`, l[kind], ledgers]);
+    }
+  }
+  return want
+    .filter(([, name, have]) => name !== undefined && !have.has(name))
+    .map(([setting, name]) => {
+      // The mistake that failed every voucher on the client's books: a group named as a ledger.
+      const hint = setting.endsWith("(ledger)") && groups.has(name!) ? " (that is a group, not a ledger)" : "";
+      return `${setting}: "${name}"${hint}`;
+    });
 }
 
 main().catch(async (err) => {

@@ -9,7 +9,7 @@
 //   NEGATIVE amount = Debit (Dr)      POSITIVE amount = Credit (Cr)
 //   Every voucher's ledger entries must sum to zero.
 
-import type { TallyNames } from "./config.js";
+import { rateKey, type RateLedgers, type TallyNames } from "./config.js";
 import type {
   CancelSalesOrderPayload,
   CreditNotePayload,
@@ -194,13 +194,11 @@ interface InventoryLineInput {
   rate?: number;
   taxableValue: number;
   unit?: string | null;
+  gstRate?: number | null;
 }
 
-function toInventory(
-  lines: InventoryLineInput[],
-  names: TallyNames,
-  accountingLedger?: string
-): InventoryEntry[] {
+/** Each line carries its sales ledger in its accounting allocation: the one for its GST rate. */
+function toInventory(lines: InventoryLineInput[], names: TallyNames): InventoryEntry[] {
   return lines.map((l) => ({
     stockItem: l.itemName,
     quantity: l.quantity,
@@ -208,31 +206,94 @@ function toInventory(
     amount: l.taxableValue,
     unit: l.unit ?? undefined,
     godown: names.godown,
-    accountingLedger,
+    accountingLedger: salesLedgerFor(l.gstRate, names),
   }));
+}
+
+function ratedLedgers(rate: number | null | undefined, names: TallyNames): RateLedgers | undefined {
+  return rate == null ? undefined : names.ledgersByRate?.[rateKey(rate)];
+}
+
+/** The sales ledger a line posts to: its GST rate's own ledger when configured, else the single one. */
+export function salesLedgerFor(rate: number | null | undefined, names: TallyNames): string {
+  return ratedLedgers(rate, names)?.sales ?? names.salesLedger;
+}
+
+/**
+ * Divides a voucher's tax total between its GST rates, for books with tax ledgers per rate.
+ *
+ * The payload carries one tax total, not tax per line, so each rate gets a share in proportion to
+ * its lines' taxable value x rate. That is exactly each rate's tax whenever an order discount is
+ * spread evenly over the lines, as the website's is. The last share is the remainder, so the
+ * shares always add up to the tax total to the paisa and the voucher still balances.
+ */
+export function taxByRate(
+  taxTotal: number,
+  lines: ReadonlyArray<{ taxableValue: number; gstRate?: number | null }>
+): Array<{ rate: number; tax: number }> {
+  const weight = new Map<number, number>();
+  for (const l of lines) {
+    if (l.gstRate == null) {
+      throw new Error(
+        `A line (taxable value ${l.taxableValue.toFixed(2)}) has no GST rate, so its tax cannot be ` +
+          `posted to that rate's own tax ledgers (TALLY_LEDGERS_BY_RATE). Set the item's GST rate.`
+      );
+    }
+    const rate = Number(l.gstRate);
+    weight.set(rate, (weight.get(rate) ?? 0) + l.taxableValue * rate);
+  }
+  const rates = [...weight].filter(([, w]) => w > 0).sort(([a], [b]) => a - b);
+  const totalWeight = rates.reduce((sum, [, w]) => sum + w, 0);
+  if (totalWeight === 0) {
+    throw new Error(`Tax of ${taxTotal.toFixed(2)} on a voucher whose lines all carry 0% GST.`);
+  }
+  let given = 0;
+  return rates.map(([rate, w], i) => {
+    const tax =
+      i === rates.length - 1 ? roundMoney(taxTotal - given) : roundMoney((taxTotal * w) / totalWeight);
+    given = roundMoney(given + tax);
+    return { rate, tax };
+  });
 }
 
 function taxLedgerEntries(
   taxTotal: number,
   buyer: BuyerTaxIdentity,
   names: TallyNames,
-  sign: 1 | -1
+  sign: 1 | -1,
+  lines: ReadonlyArray<{ taxableValue: number; gstRate?: number | null }>
 ): LedgerEntry[] {
   if (taxTotal === 0) return [];
-  const split = splitGst(taxTotal, buyer, names);
-  const entries: LedgerEntry[] = [];
-  if (split.igst > 0) {
-    entries.push({ ledger: names.igstLedger, amount: sign * split.igst });
-  } else {
-    if (split.cgst > 0) entries.push({ ledger: names.cgstLedger, amount: sign * split.cgst });
-    if (split.sgst > 0) entries.push({ ledger: names.sgstLedger, amount: sign * split.sgst });
+  const shares = names.ledgersByRate ? taxByRate(taxTotal, lines) : [{ rate: null, tax: taxTotal }];
+  // Summed per ledger: two rates that fall back to the same single ledger make one line, not two.
+  const byLedger = new Map<string, number>();
+  const add = (ledger: string, amount: number) => {
+    if (amount > 0) byLedger.set(ledger, roundMoney((byLedger.get(ledger) ?? 0) + amount));
+  };
+  for (const { rate, tax } of shares) {
+    const split = splitGst(tax, buyer, names);
+    const own = ratedLedgers(rate, names);
+    add(own?.igst ?? names.igstLedger, split.igst);
+    add(own?.cgst ?? names.cgstLedger, split.cgst);
+    add(own?.sgst ?? names.sgstLedger, split.sgst);
   }
-  return entries;
+  return [...byLedger].map(([ledger, amount]) => ({ ledger, amount: sign * amount }));
 }
 
 /* -------------------------------------------------------------------------- */
 /*  1. Sales Order                                                            */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * The order number a Sales Order is filed under: the payload's own, else the website's short order
+ * id — the first 8 characters of the id in `push_sales_order:<order id>`, as the website shows it
+ * ("Order #1a2b3c4d"). Upper-cased, as Tally users type order numbers.
+ */
+export function salesOrderNumber(p: Pick<SalesOrderPayload, "orderNumber" | "remoteId">): string {
+  if (p.orderNumber?.trim()) return p.orderNumber.trim();
+  const id = p.remoteId.slice(p.remoteId.lastIndexOf(":") + 1);
+  return id.slice(0, 8).toUpperCase();
+}
 
 export function buildSalesOrderXml(
   p: SalesOrderPayload,
@@ -243,7 +304,14 @@ export function buildSalesOrderXml(
   // Goods go OUT -> each line is a Credit, and carries the sales ledger in its ACCOUNTINGALLOCATIONS.
   // That allocation IS the sales posting: invoice-mode vouchers must not ALSO list the sales ledger
   // as a ledger line, or sales count twice and Tally rejects the voucher (verified live).
-  const inventoryEntries = toInventory(p.lineItems, names, names.salesLedger);
+  // Every line is filed under the order number, due on the order date — as the client's own Sales
+  // Orders are. Without it Tally answers "Bad Order Number in Voucher!" (verified 2026-09-26).
+  const orderNo = salesOrderNumber(p);
+  const inventoryEntries = toInventory(p.lineItems, names).map((i) => ({
+    ...i,
+    orderNo,
+    orderDueDate: p.orderDate,
+  }));
   const lineTotal = roundMoney(inventoryEntries.reduce((sum, i) => sum + i.amount, 0));
   const discount = invoiceDiscount(lineTotal, p.taxTotal, p.grandTotal, p.discountAmount);
 
@@ -262,7 +330,8 @@ export function buildSalesOrderXml(
       p.taxTotal,
       { gstin: p.buyer.gstin ?? null, state: p.buyer.state ?? null },
       names,
-      1
+      1,
+      p.lineItems
     )
   );
 
@@ -275,6 +344,7 @@ export function buildSalesOrderXml(
     date: p.orderDate,
     remoteId: p.remoteId,
     partyLedger: p.buyer.ledgerName,
+    reference: orderNo,
     narration: p.notes ?? undefined,
     isInvoice: true,
     view: "Invoice Voucher View",
@@ -305,7 +375,7 @@ export function buildDeliveryNoteXml(
         "sends it from the order's customer ledger; check buildDeliveryNotePayload()."
     );
   }
-  const inventoryEntries = toInventory(p.lineItems, names, names.salesLedger); // goods out -> Credit
+  const inventoryEntries = toInventory(p.lineItems, names); // goods out -> Credit
   const lineTotal = roundMoney(inventoryEntries.reduce((sum, i) => sum + i.amount, 0));
   const ledgerEntries: LedgerEntry[] = [
     { ledger: p.buyerLedgerName, amount: -lineTotal, isPartyLedger: true },
@@ -344,7 +414,7 @@ export function buildCreditNoteXml(
   // Mirror image of the sale: goods come back IN -> each line is a Debit (negative), carrying the
   // sales ledger in its allocation; we now owe the customer -> party is a Credit. Posting the
   // returned goods as a Credit (upstream's sign) left the voucher unbalanced and Tally rejected it.
-  const inventoryEntries = toInventory(p.lineItems, names, names.salesLedger).map((i) => ({
+  const inventoryEntries = toInventory(p.lineItems, names).map((i) => ({
     ...i,
     amount: -i.amount,
   }));
@@ -356,7 +426,8 @@ export function buildCreditNoteXml(
       taxTotal,
       { gstin: p.buyerGstin ?? null, state: p.buyerState ?? null },
       names,
-      -1
+      -1,
+      p.lineItems
     )
   );
   assertVoucherBalanced(ledgerEntries, inventoryEntries);
@@ -482,10 +553,12 @@ export function buildCancelSalesOrderXml(
 ): string {
   // The Sales Order is identified by the REMOTEID it was pushed with — the app always sends it as
   // referencedSalesOrderRemoteId. Verified live: cancel-by-REMOTEID needs no date or number.
+  // The narration is always sent: with no reason the <VOUCHER> element went out empty, and Tally
+  // refused it ("Cannot process 'empty' object: VOUCHER!", verified 2026-09-26).
   const body = renderCancelVoucher({
     voucherType: names.salesOrderVoucherType,
     remoteId: p.referencedSalesOrderRemoteId,
-    narration: p.reason ?? undefined,
+    narration: p.reason?.trim() || "Cancelled on the Excer website",
   });
   return voucherImportEnvelope(body, company);
 }

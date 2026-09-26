@@ -138,6 +138,11 @@ export const salesOrderPayloadSchema = z.object({
   taxTotal: nonNegativeMoney,
   grandTotal: nonNegativeMoney,
   notes: text,
+  /**
+   * The order number Tally files the Sales Order under (its lines' ORDERNO). Optional: without it
+   * the agent uses the website's short order id from `remoteId` — see `salesOrderNumber()`.
+   */
+  orderNumber: text,
 });
 
 export const deliveryNotePayloadSchema = z.object({

@@ -101,11 +101,34 @@ changes back, through a Cloudflare Tunnel so nothing is exposed. See [prd.md](pr
   load. Leftover `TUPDATE.TSF` / `TDBK*.001` files are the sign. Data → Repair fixed it with no
   loss; Tally then migrates the copy's data format on first load. Both offer a TallyDrive (cloud)
   backup first — switch it off for client data.
+- **Tally keeps a rejected voucher, hidden.** An import that fails with `EXCEPTIONS 1` can still
+  store the voucher under its REMOTEID, invisible to the REMOTEID lookup; re-importing the same
+  REMOTEID then answers `ALTERED 1` and repairs it. Harmless for retries (no duplicate), but a
+  push that fails and is never retried leaves a hidden partial voucher (2026-09-26).
+- **Educational mode's date rule covers more than vouchers**: price-list dates too. An Alter
+  whose `STANDARDPRICELIST` entry has a disallowed date drops it silently and REPLACES the list,
+  leaving it empty. On a licensed Tally this does not apply.
+- **Deleting a stock item through XML crashed this TallyPrime** (Memory Access Violation), twice,
+  also with nothing else talking to Tally. The agent never deletes; do not script it in tests.
+- **Tally starts at the company login screen** when the company has users. Until someone logs in
+  every query answers empty; the agent now reports "company … is not open" instead of blaming
+  the counters, and resumes by itself after login.
+- **The client's books keep ledgers per GST rate** (`Sales@18%`, `CGST@9%`, `IGST @18%` …, with
+  inconsistent spacing) — configure `TALLY_LEDGERS_BY_RATE`; `npm run doctor` checks every name.
+  "Sales Accounts" is a group there, not a ledger.
 
 ## 7. Open items
 
-1. **Sales Order** is rejected (`Bad Order Number in Voucher!`) in every layout tried. Next step:
-   enter one by hand in Tally (Alt+F5), export it, copy the structure.
+1. ~~Sales Order rejected~~ fixed 2026-09-26: lines need `ORDERNO` + `ORDERDUEDATE` in their batch
+   allocations, as in the client's own 5,191 Sales Orders.
 2. ~~Client questions~~ answered 2026-09-26: the service is allowed; Tally owns stock (§5).
-3. The client's real voucher-type/ledger/group names for `.env`.
+3. The client's real voucher-type/ledger/group names for `.env` — verified on the client copy
+   (see `.env.example`); still ask which ledgers 28% and exempt items use.
 4. Whether the client sets GST/HSN per item or per stock group (group → `gstRate` null).
+5. **An item deleted in Tally stays on the website**: a deleted master vanishes from Tally's
+   collections, and the incremental pull only sends what changed. Needs the agent to send the
+   full list of item GUIDs now and then, and the website to hide products missing from it.
+6. Which godown website dispatches come from (the client has 103 bin godowns; default is
+   "Main Location").
+7. The website's cancel payload should send `salesOrderDate` (the order's date): the lookup is
+   then one day instead of the whole year (0.3s instead of 12–20s on the client's books).

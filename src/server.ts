@@ -110,7 +110,14 @@ export function createAgentServer(config: AgentConfig, client: TallyClient, poll
     // Tally's own answer for a missing REMOTEID ("The date 0-0-0 is Out of Range!"), and an order
     // that is already cancelled makes a retried cancel a duplicate, not a second write.
     if (req.type === "push_cancel_sales_order") {
-      const order = await findVoucherByRemoteId(client, req.referencedSalesOrderRemoteId, null, company);
+      // Searched on the order's own day first: without a date Tally scans every voucher of the
+      // year, which took 12-20s per call on the client's books (111k vouchers) and holds up
+      // everything else queued on Tally. The whole-year search stays as the fallback, so a
+      // missing or mismatched date can never turn into a false "not in Tally".
+      const order =
+        (req.salesOrderDate &&
+          (await findVoucherByRemoteId(client, req.referencedSalesOrderRemoteId, req.salesOrderDate, company))) ||
+        (await findVoucherByRemoteId(client, req.referencedSalesOrderRemoteId, null, company));
       if (!order) {
         throw new HttpError(
           422,
@@ -217,7 +224,8 @@ export function createAgentServer(config: AgentConfig, client: TallyClient, poll
         success: true,
         guid: identity?.guid || undefined,
         voucherNumber: identity?.voucherNumber ?? undefined,
-        tallyResult: result,
+        // Counts only. Tally's raw reply (~2 KB of XML) would be stored on every website job.
+        tallyResult: { ...result, raw: undefined },
       },
     };
   }

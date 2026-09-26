@@ -221,9 +221,26 @@ built by the website's own mapping code:
   the item allocations; returns are debits; Stock Journal needs `INVENTORYENTRIESOUT/IN.LIST`.
 - ✅ `ISOPTIONAL` posts Optional vouchers, which don't touch stock until converted.
 - ✅ Cancel by REMOTEID.
-- ❌ **Sales Order: still rejected — `Bad Order Number in Voucher!`** in every layout tried, even
-  after enabling order processing. Needs one Sales Order entered by hand in Tally to copy its
-  exact XML. Until then Sales Orders fail as a clear `422` (retried), never as a false success.
+- ✅ **Sales Order** (fixed 2026-09-26): every line's batch allocation carries `ORDERNO` +
+  `ORDERDUEDATE`, as in the client's own Sales Orders; without them Tally answers
+  `Bad Order Number in Voucher!`. The order number is the payload's `orderNumber`, else the
+  website's short order id.
+
+### Verified against the client's own books (copy, 2026-09-26)
+
+Company `EXCER GLOBAL PRIVATE LIMITED - (26-27)`, through the running agent and the local website:
+
+- ✅ Tally → website: price change (19s), new item (10s, live because it is priced and filed),
+  voucher stock in / Delivery Note out / voucher deleted (15–40s).
+- ✅ Website → Tally: new customer ledger (+ retry duplicate, + name clash `409`), Delivery Note
+  **Regular** (stock 25 → 22 in Tally and on the website), Credit Note, Stock Journal, Sales Order
+  (one rate and two rates, in-state and IGST), cancel (with and without a reason), each retried.
+- ✅ Tally closed, and Tally waiting at the company login: reported, then recovered by itself.
+- Fixed on the way: ledgers per GST rate (`TALLY_LEDGERS_BY_RATE`); a doctor check that every
+  configured name exists; Sales Order order numbers; a cancel with no reason sent an empty
+  voucher; cancel lookups scanned the whole year; the success reply carried Tally's raw XML;
+  a closed company was reported as reachable.
+- Not testable there: a website customer linked to a Tally ledger (none are linked yet).
 
 Still to check on the client's real Tally: every name in `.env.example`'s bottom section, and
 whether GST rates/HSN are set on items or inherited from stock groups (inherited → `gstRate` null →

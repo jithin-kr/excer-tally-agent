@@ -26,6 +26,8 @@ import type { TallyLedgerRow, TallyOutstandingRow, TallyStockItemRow } from "./c
 export interface LastAlterIds {
   masters: number;
   vouchers: number;
+  /** False when the configured company is not open in Tally (closed, or waiting at its login). */
+  companyOpen: boolean;
 }
 
 /**
@@ -41,16 +43,26 @@ export async function getLastAlterIds(client: TallyClient, company?: string): Pr
     tdlMessage: `
       <COLLECTION NAME="ExcerAlterIds" ISMODIFY="No">
         <TYPE>Company</TYPE>
+        <FETCH>Name</FETCH>
         <FETCH>AltMstId</FETCH>
         <FETCH>AltVchId</FETCH>
       </COLLECTION>`,
   });
   const tree = parseTallyXmlAsStrings(await client.send(xml));
   const collection = tree?.ENVELOPE?.BODY?.DATA?.COLLECTION ?? tree?.ENVELOPE?.BODY?.DATA ?? {};
-  const company0 = asArray(collection?.COMPANY)[0] ?? {};
+  // The collection lists the companies OPEN in Tally. Take the configured one by name: the first
+  // row could be another open company, and no row at all means ours is not open — e.g. Tally is
+  // waiting at the company login screen (verified 2026-09-26), where every query answers empty.
+  const rows = asArray(collection?.COMPANY);
+  const nameOf = (row: any) => text(row?.["@_NAME"] ?? row?.NAME);
+  const row =
+    company && rows.some((r: any) => nameOf(r))
+      ? rows.find((r: any) => nameOf(r) === company)
+      : rows[0];
   return {
-    masters: n(company0?.ALTMSTID),
-    vouchers: n(company0?.ALTVCHID),
+    masters: n(row?.ALTMSTID),
+    vouchers: n(row?.ALTVCHID),
+    companyOpen: row !== undefined,
   };
 }
 
@@ -332,4 +344,28 @@ export async function fetchOutstandings(
       };
     })
     .filter((r: TallyOutstandingRow) => r.balance !== 0);
+}
+
+/**
+ * Every name of one master type in the company ("Ledger", "VoucherType", "Group", "Godown"),
+ * for checking the configured names exist before a voucher ever uses them.
+ */
+export async function fetchMasterNames(
+  client: TallyClient,
+  type: "Ledger" | "VoucherType" | "Group" | "Godown",
+  company?: string
+): Promise<Set<string>> {
+  const xml = buildExportCollectionEnvelope({
+    collectionName: "ExcerNames",
+    staticVariables: { company },
+    tdlMessage: `
+      <COLLECTION NAME="ExcerNames" ISMODIFY="No">
+        <TYPE>${type}</TYPE>
+        <FETCH>Name</FETCH>
+      </COLLECTION>`,
+  });
+  const tree = parseTallyXmlAsStrings(await client.send(xml));
+  const collection = tree?.ENVELOPE?.BODY?.DATA?.COLLECTION ?? tree?.ENVELOPE?.BODY?.DATA ?? {};
+  const tag = type.toUpperCase();
+  return new Set(asArray(collection?.[tag]).map((row: any) => text(row?.["@_NAME"] ?? row?.NAME)));
 }
