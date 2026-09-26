@@ -45,6 +45,7 @@ const isFullStockFetch = (xml: string) =>
 test("nothing moved: only the counter is read", async () => {
   const { client, requests } = tally(10, 20);
   const state = createPollState({ lastMasterAlterId: 10, lastVoucherAlterId: 20 });
+  state.lastItemListAt = Date.now(); // item list already sent this half hour
   assert.equal(await pollOnce(agentConfig({ stateFile: join(dir, "s.json") }), client, state), false);
   assert.equal(requests.length, 1);
   assert.equal(state.tallyReachable, true);
@@ -63,9 +64,57 @@ test("voucher refresh is rate-limited, and a skipped change is not lost", async 
   const { client, requests } = tally(10, 21);
   const state = createPollState({ lastMasterAlterId: 10, lastVoucherAlterId: 20 });
   state.lastStockRefreshAt = Date.now(); // just refreshed
+  state.lastItemListAt = Date.now();
   assert.equal(await pollOnce(agentConfig({ stateFile: join(dir, "s.json") }), client, state), false);
   assert.equal(requests.length, 1);
   assert.equal(state.lastVoucherAlterId, 20); // still pending for a later tick
+});
+
+/* ── the full item list: how items deleted in Tally leave the website ── */
+
+/** A fake Tally that also answers the GUID-only item list. */
+function tallyWithItems(masters: number, vouchers: number, guids: string[]) {
+  return fakeClient((xml) => {
+    switch (collectionId(xml)) {
+      case "ExcerAlterIds":
+        return counters(masters, vouchers);
+      case "ExcerStockItemGuids":
+        return collection(guids.map((g) => `<STOCKITEM><GUID>${g}</GUID></STOCKITEM>`).join(""));
+      default:
+        return collection("");
+    }
+  });
+}
+
+test("item list: sent with a master change, so a deletion reaches the website", async () => {
+  // A deleted item moves the masters counter but appears in no "since" export.
+  const { client } = tallyWithItems(11, 20, ["g-1", "g-2"]);
+  const state = createPollState({ lastMasterAlterId: 10, lastVoucherAlterId: 20 });
+  state.lastItemListAt = Date.now();
+  assert.equal(await pollOnce(agentConfig({ stateFile: join(dir, "s.json") }), client, state), true);
+  assert.deepEqual(posted[0].allStockItemGuids, ["g-1", "g-2"]);
+  assert.deepEqual(posted[0].stockItems, []);
+});
+
+test("item list: sent on the first poll after a start, and then every half hour", async () => {
+  const { client, requests } = tallyWithItems(10, 20, ["g-1"]);
+  const state = createPollState({ lastMasterAlterId: 10, lastVoucherAlterId: 20 });
+  const config = agentConfig({ stateFile: join(dir, "s.json") });
+  assert.equal(await pollOnce(config, client, state), true); // first poll: deletions while down
+  assert.deepEqual(posted[0].allStockItemGuids, ["g-1"]);
+  const before = requests.length;
+  assert.equal(await pollOnce(config, client, state), false); // right after: only the counter
+  assert.equal(requests.length, before + 1);
+  state.lastItemListAt = Date.now() - config.itemListIntervalMs; // half an hour later
+  assert.equal(await pollOnce(config, client, state), true);
+  assert.equal(posted.length, 2);
+});
+
+test("item list: an empty list is never sent (the website would read it as every item deleted)", async () => {
+  const { client } = tallyWithItems(10, 20, []);
+  const state = createPollState({ lastMasterAlterId: 10, lastVoucherAlterId: 20 });
+  assert.equal(await pollOnce(agentConfig({ stateFile: join(dir, "s.json") }), client, state), false);
+  assert.equal(posted.length, 0);
 });
 
 test("counter went backwards (restored backup): full re-sync instead of stalling forever", async () => {

@@ -125,10 +125,9 @@ changes back, through a Cloudflare Tunnel so nothing is exposed. See [prd.md](pr
 3. The client's real voucher-type/ledger/group names for `.env` — verified on the client copy
    (see `.env.example`); still ask which ledgers 28% and exempt items use.
 4. Whether the client sets GST/HSN per item or per stock group (group → `gstRate` null).
-5. **An item deleted in Tally stays on the website**: a deleted master vanishes from Tally's
-   collections, and the incremental pull only sends what changed. Needs the agent to send the
-   full list of item GUIDs now and then, and the website to hide products missing from it.
+5. ~~An item deleted in Tally stays on the website~~ fixed 2026-09-26: the agent sends the full
+   list of item GUIDs (`allStockItemGuids`) on a master change, on start and every 30 min; the
+   website hides live Tally products missing from it (website CLAUDE.md §50).
 6. Which godown website dispatches come from (the client has 103 bin godowns; default is
    "Main Location").
-7. The website's cancel payload should send `salesOrderDate` (the order's date): the lookup is
-   then one day instead of the whole year (0.3s instead of 12–20s on the client's books).
+7. ~~Cancel scanned the whole year~~ fixed 2026-09-26: the website sends `salesOrderDate`.

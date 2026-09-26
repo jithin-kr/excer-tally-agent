@@ -32,6 +32,7 @@ export function agentConfig(overrides: Partial<AgentConfig> = {}): AgentConfig {
     agentId: "test-agent",
     postVouchersAsOptional: true,
     postDeliveryNotesAsOptional: false,
+    itemListIntervalMs: 30 * 60_000,
     tallyNames: names,
     ...overrides,
   };

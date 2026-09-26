@@ -369,3 +369,25 @@ export async function fetchMasterNames(
   const tag = type.toUpperCase();
   return new Set(asArray(collection?.[tag]).map((row: any) => text(row?.["@_NAME"] ?? row?.NAME)));
 }
+
+/**
+ * The GUID of every stock item in the company, and nothing else, so it stays cheap on a large
+ * catalog. The website hides products whose item is missing from it: a deleted item vanishes from
+ * Tally's collections, so the "what changed" export can never report it.
+ */
+export async function fetchStockItemGuids(client: TallyClient, company?: string): Promise<string[]> {
+  const xml = buildExportCollectionEnvelope({
+    collectionName: "ExcerStockItemGuids",
+    staticVariables: { company },
+    tdlMessage: `
+      <COLLECTION NAME="ExcerStockItemGuids" ISMODIFY="No">
+        <TYPE>StockItem</TYPE>
+        <FETCH>GUID</FETCH>
+      </COLLECTION>`,
+  });
+  const tree = parseTallyXmlAsStrings(await client.send(xml));
+  const collection = tree?.ENVELOPE?.BODY?.DATA?.COLLECTION ?? tree?.ENVELOPE?.BODY?.DATA ?? {};
+  return asArray(collection?.STOCKITEM)
+    .map((row: any) => s(row?.GUID))
+    .filter((guid: string) => guid.length > 0);
+}

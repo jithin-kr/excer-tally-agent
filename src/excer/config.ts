@@ -119,6 +119,12 @@ export interface AgentConfig {
    * still alter or delete one in Tally.
    */
   postDeliveryNotesAsOptional: boolean;
+  /**
+   * How often the full list of stock item GUIDs is sent even when no master changed (ms), so the
+   * website hides products whose item was deleted in Tally. Also sent on every master change and
+   * on the first poll after a start.
+   */
+  itemListIntervalMs: number;
   tallyNames: TallyNames;
 }
 
@@ -181,6 +187,7 @@ export function loadAgentConfig(): AgentConfig {
     agentId: process.env.AGENT_ID?.trim() || "excer-tally-agent-1",
     postVouchersAsOptional: bool("TALLY_POST_VOUCHERS_AS_OPTIONAL", true),
     postDeliveryNotesAsOptional: bool("TALLY_POST_DELIVERY_NOTES_AS_OPTIONAL", false),
+    itemListIntervalMs: int("ITEM_LIST_INTERVAL_MS", 30 * 60_000),
     tallyNames: loadTallyNames(),
   };
 }

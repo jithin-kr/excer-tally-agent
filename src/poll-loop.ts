@@ -19,7 +19,7 @@
 
 import type { AgentConfig } from "./excer/config.js";
 import type { TallyClient } from "./tally/client.js";
-import { fetchLedgers, fetchStockItems, getLastAlterIds } from "./excer/masters.js";
+import { fetchLedgers, fetchStockItemGuids, fetchStockItems, getLastAlterIds } from "./excer/masters.js";
 import { errorMessage, log } from "./log.js";
 import { saveWatermarks, type Watermarks } from "./state-store.js";
 
@@ -31,6 +31,8 @@ export interface PollState extends Watermarks {
   tallyReachable: boolean;
   /** When stock balances were last fully re-read because vouchers moved (ms since epoch). */
   lastStockRefreshAt: number;
+  /** When the full list of stock item GUIDs was last sent (ms since epoch; 0 = not since start). */
+  lastItemListAt: number;
 }
 
 export function createPollState(marks: Watermarks): PollState {
@@ -41,6 +43,7 @@ export function createPollState(marks: Watermarks): PollState {
     consecutiveFailures: 0,
     tallyReachable: false,
     lastStockRefreshAt: 0,
+    lastItemListAt: 0,
   };
 }
 
@@ -133,7 +136,13 @@ export async function pollOnce(
     ids.vouchers !== state.lastVoucherAlterId &&
     Date.now() - state.lastStockRefreshAt >= config.stockRefreshMinIntervalMs;
 
-  if (!mastersMoved && !vouchersMoved) {
+  // The full item list lets the website hide items deleted in Tally, which no "since" export can
+  // mention. Sent on a master change, on the first poll after a start (a deletion while we were
+  // down), and every itemListIntervalMs in case a deletion does not move the counter.
+  const sendItemList =
+    mastersMoved || Date.now() - state.lastItemListAt >= config.itemListIntervalMs;
+
+  if (!mastersMoved && !vouchersMoved && !sendItemList) {
     return false; // nothing changed — this is the common case, and it costs almost nothing
   }
 
@@ -146,14 +155,21 @@ export async function pollOnce(
     ? await fetchLedgers(client, since, company, config.tallyNames.customerParentGroup)
     : [];
 
-  if (stockItems.length > 0 || ledgers.length > 0) {
+  // Never an empty list: the website would read it as "every item deleted" (it refuses, but a
+  // company with no items has nothing to hide anyway).
+  const itemGuids = sendItemList ? await fetchStockItemGuids(client, company) : [];
+  const allStockItemGuids = itemGuids.length > 0 ? itemGuids : undefined;
+
+  if (stockItems.length > 0 || ledgers.length > 0 || allStockItemGuids) {
     await postToApp(config, "/api/tally/pull", {
       agentId: config.agentId,
       sinceAlterId: since,
       stockItems,
       ledgers,
+      ...(allStockItemGuids ? { allStockItemGuids } : {}),
     });
   }
+  if (sendItemList) state.lastItemListAt = Date.now();
 
   // Only advance the watermarks after the app has accepted the batch. If the POST throws, we
   // re-send the same rows next tick rather than skipping them — at-least-once, which is safe
@@ -168,7 +184,7 @@ export async function pollOnce(
     state.lastStockRefreshAt = Date.now();
   }
   persist();
-  return stockItems.length > 0 || ledgers.length > 0;
+  return stockItems.length > 0 || ledgers.length > 0 || allStockItemGuids !== undefined;
 }
 
 export function startPollLoop(config: AgentConfig, client: TallyClient, state: PollState) {
